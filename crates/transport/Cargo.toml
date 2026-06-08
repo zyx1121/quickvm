@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+bytes = "1.11.1"
 quickvm-event = { version = "0.1.0", path = "../event" }
 quickvm-proto = { version = "0.1.0", path = "../proto" }
 quinn = "0.11.9"
