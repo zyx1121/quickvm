@@ -952,6 +952,8 @@ name = "quickvm-capture"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-foundation",
+ "core-graphics",
  "quickvm-event",
  "tokio",
  "tracing",

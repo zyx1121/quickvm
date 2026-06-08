@@ -8,3 +8,7 @@ anyhow = "1.0.102"
 quickvm-event = { version = "0.1.0", path = "../event" }
 tokio = { version = "1.52.3", features = ["sync", "rt", "macros"] }
 tracing = "0.1.44"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+core-graphics = "0.25.0"
