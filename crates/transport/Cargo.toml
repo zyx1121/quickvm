@@ -1,0 +1,14 @@
+[package]
+name = "quickvm-transport"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+quickvm-event = { version = "0.1.0", path = "../event" }
+quickvm-proto = { version = "0.1.0", path = "../proto" }
+quinn = "0.11.9"
+rcgen = "0.14.8"
+rustls = "0.23.40"
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"

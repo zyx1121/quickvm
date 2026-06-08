@@ -1,0 +1,10 @@
+[package]
+name = "quickvm-capture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+quickvm-event = { version = "0.1.0", path = "../event" }
+tokio = { version = "1.52.3", features = ["sync", "rt", "macros"] }
+tracing = "0.1.44"
