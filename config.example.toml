@@ -1,0 +1,16 @@
+# quickvm 主控端設定檔。複製到 ~/.config/quickvm/config.toml 後修改。
+#
+# 邊緣切換：游標撞到「朝向對端那側」的螢幕邊緣才穿過去控制對端。
+# side 描述對端(remote)相對本機(local)的方位：left / right / top / bottom。
+#   side = "right" → 對端在本機右邊 → 推到本機右緣穿過去、在對端推回左緣切回來。
+
+server = "192.168.1.120:7777"
+
+[local]   # 本機 (Mac) 螢幕像素尺寸
+width = 1080
+height = 1920
+
+[remote]  # 對端 (Windows) 螢幕
+width = 1920
+height = 1080
+side = "right"
