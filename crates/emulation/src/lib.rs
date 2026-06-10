@@ -33,6 +33,10 @@ impl InputEmulator for EnigoEmulator {
                 let py = (y * self.screen.1 as f64).round() as i32;
                 self.enigo.move_mouse(px, py, enigo::Coordinate::Abs)?;
             }
+            Event::MotionRel { dx, dy } => {
+                self.enigo
+                    .move_mouse(*dx as i32, *dy as i32, enigo::Coordinate::Rel)?;
+            }
             Event::Button { button, dir } => {
                 self.enigo.button(map_button(*button), map_dir(*dir))?;
             }

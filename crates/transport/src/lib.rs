@@ -41,7 +41,13 @@ fn client_config() -> Result<ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(SkipVerify))
         .with_no_client_auth();
     let qcc = QuicClientConfig::try_from(Arc::new(tls))?;
-    Ok(ClientConfig::new(Arc::new(qcc)))
+    let mut cc = ClientConfig::new(Arc::new(qcc));
+    // keep-alive：閒置時定期 PING 保活，否則使用者一段時間不動鍵鼠 → idle timeout 斷線。
+    // 單端開即可（PING 往返重置雙方 idle timer）；interval 須 < server 預設 idle (~30s)。
+    let mut tc = quinn::TransportConfig::default();
+    tc.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    cc.transport_config(Arc::new(tc));
+    Ok(cc)
 }
 
 /// 被控端：監聽，接受連線，把收到的事件推進 channel。

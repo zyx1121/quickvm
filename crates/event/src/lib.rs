@@ -48,6 +48,9 @@ pub enum Event {
     Button { button: MouseButton, dir: Direction },
     /// 指標絕對位置，正規化到 [0.0, 1.0]（跨解析度 / DPI 無關）。
     MotionAbs { x: f64, y: f64 },
+    /// 指標相對位移（點）。grab 模式下系統游標 freeze，絕對位置失效，
+    /// 改累積 delta 算虛擬游標位置。只在主控端本機 capture→app 流動，不上線。
+    MotionRel { dx: f64, dy: f64 },
     /// 高解析度捲動（120 = 一個滾輪 tick）。
     Scroll { dx: i32, dy: i32 },
 }

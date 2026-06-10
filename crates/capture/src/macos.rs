@@ -15,7 +15,19 @@ use core_graphics::event::{
     CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     CallbackResult, EventField,
 };
+use core_graphics::geometry::CGPoint;
 use quickvm_event::{Direction, Event, MouseButton};
+
+// CoreGraphics 游標控制 C API（core-graphics crate 未提供 binding）。
+// grab 期間解除「實體滑鼠↔游標」連動使系統游標 freeze（但 event tap 仍收到 delta），
+// 並隱藏游標；放開時 warp 回螢幕中央再恢復連動，避免一放開又撞到 enter 邊緣。
+unsafe extern "C" {
+    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -23,12 +35,15 @@ use tokio::sync::mpsc;
 
 pub struct MacCapture {
     grab: Arc<AtomicBool>,
+    /// 主螢幕像素尺寸，放開 grab 時 warp 游標回中央用。
+    screen: (f64, f64),
 }
 
 impl MacCapture {
     pub fn new() -> Self {
         Self {
             grab: Arc::new(AtomicBool::new(false)),
+            screen: screen_size(),
         }
     }
 }
@@ -45,6 +60,19 @@ impl InputCapture for MacCapture {
 
     fn set_grab(&mut self, grab: bool) {
         self.grab.store(grab, Ordering::SeqCst);
+        unsafe {
+            if grab {
+                // 解除連動 → 系統游標 freeze（delta 仍會進 event tap）+ 隱藏。
+                CGAssociateMouseAndMouseCursorPosition(0);
+                CGDisplayHideCursor(CGMainDisplayID());
+            } else {
+                // 先 warp 回中央（避免一放開又落在 enter 邊緣反覆觸發），再恢復連動 + 顯示。
+                let c = CGPoint::new(self.screen.0 / 2.0, self.screen.1 / 2.0);
+                CGWarpMouseCursorPosition(c);
+                CGAssociateMouseAndMouseCursorPosition(1);
+                CGDisplayShowCursor(CGMainDisplayID());
+            }
+        }
     }
 }
 
@@ -72,10 +100,11 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>) {
         CGEventTapOptions::Default,
         events,
         move |_proxy, etype, event| {
-            if let Some(ev) = translate(etype, event, w, h) {
+            let g = grab.load(Ordering::SeqCst);
+            if let Some(ev) = translate(etype, event, w, h, g) {
                 let _ = tx.send(ev);
             }
-            if grab.load(Ordering::SeqCst) {
+            if g {
                 CallbackResult::Drop
             } else {
                 CallbackResult::Keep
@@ -105,15 +134,22 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>) {
     CFRunLoop::run_current();
 }
 
-fn translate(etype: CGEventType, event: &CGEvent, w: f64, h: f64) -> Option<Event> {
+fn translate(etype: CGEventType, event: &CGEvent, w: f64, h: f64, grab: bool) -> Option<Event> {
     use CGEventType::*;
     match etype {
         MouseMoved | LeftMouseDragged | RightMouseDragged | OtherMouseDragged => {
-            let p = event.location();
-            Some(Event::MotionAbs {
-                x: (p.x / w).clamp(0.0, 1.0),
-                y: (p.y / h).clamp(0.0, 1.0),
-            })
+            if grab {
+                // grab 期間游標 freeze，絕對位置不再變 → 改送相對位移。
+                let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f64;
+                let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64;
+                Some(Event::MotionRel { dx, dy })
+            } else {
+                let p = event.location();
+                Some(Event::MotionAbs {
+                    x: (p.x / w).clamp(0.0, 1.0),
+                    y: (p.y / h).clamp(0.0, 1.0),
+                })
+            }
         }
         LeftMouseDown => Some(btn(MouseButton::Left, Direction::Press)),
         LeftMouseUp => Some(btn(MouseButton::Left, Direction::Release)),
