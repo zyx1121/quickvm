@@ -58,7 +58,10 @@ async fn main() -> Result<()> {
             while let Some(ev) = rx.recv().await {
                 match ev {
                     Event::MotionAbs { x, y } => link.send_motion(x, y)?,
-                    other => link.send_reliable(&Reliable::Input(other)).await?,
+                    other => {
+                        tracing::debug!(?other, "reliable →");
+                        link.send_reliable(&Reliable::Input(other)).await?;
+                    }
                 }
             }
         }
