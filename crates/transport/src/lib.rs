@@ -66,12 +66,17 @@ pub async fn serve(bind: SocketAddr) -> Result<mpsc::Receiver<Incoming>> {
 }
 
 fn spawn_recv(conn: Connection, tx: mpsc::Sender<Incoming>) {
-    // datagram（指標移動）
+    // datagram（指標移動）：丟棄過期 / 亂序封包（WiFi 上會亂序，舊封包會讓游標往回跳 → stutter）。
     let c = conn.clone();
     let t = tx.clone();
     tokio::spawn(async move {
+        let mut last_seq = 0u64;
         while let Ok(b) = c.read_datagram().await {
             if let Ok(m) = decode_motion(&b) {
+                if m.seq <= last_seq {
+                    continue;
+                }
+                last_seq = m.seq;
                 let _ = t.send(Incoming::Motion(m)).await;
             }
         }
@@ -123,6 +128,11 @@ impl Link {
         });
         self.conn.send_datagram(bytes::Bytes::from(bytes))?;
         Ok(())
+    }
+
+    /// 當前路徑的估計 round-trip 時間（診斷用）。
+    pub fn rtt(&self) -> std::time::Duration {
+        self.conn.rtt()
     }
 }
 

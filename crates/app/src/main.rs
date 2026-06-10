@@ -42,7 +42,7 @@ enum Cmd {
     },
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     match Cli::parse().cmd {
@@ -93,6 +93,9 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
     // Remote 模式下的虛擬游標（對端像素座標）。
     let (mut vx, mut vy) = (0.0_f64, 0.0_f64);
     let mut mods = Modifiers::default();
+    // 診斷：motion 更新率。
+    let mut motion_count = 0u64;
+    let mut last_report = std::time::Instant::now();
 
     while let Some(ev) = rx.recv().await {
         match target {
@@ -118,6 +121,12 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
                 Event::MotionRel { dx, dy } => {
                     vx += dx;
                     vy += dy;
+                    motion_count += 1;
+                    if last_report.elapsed().as_secs() >= 1 {
+                        tracing::info!(rate = motion_count, rtt_ms = link.rtt().as_millis() as u64, "motion/s + QUIC rtt");
+                        motion_count = 0;
+                        last_report = std::time::Instant::now();
+                    }
                     if left_remote(cfg.remote.side, vx, vy, cfg.remote.width, cfg.remote.height) {
                         link.send_reliable(&Reliable::Control(Control::Leave)).await?;
                         cap.set_grab(false);

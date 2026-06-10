@@ -28,6 +28,32 @@ unsafe extern "C" {
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
 }
+
+/// 把純 CLI process 提升為 GUI app —— 否則上面的 disassociate / hide cursor 回傳成功卻
+/// 靜默無效（需要 window server 連接）。kProcessTransformToForegroundApplication = 1。
+#[repr(C)]
+struct ProcessSerialNumber {
+    high_long_of_psn: u32,
+    low_long_of_psn: u32,
+}
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn TransformProcessType(psn: *const ProcessSerialNumber, transform_state: u32) -> i32;
+}
+const K_CURRENT_PROCESS: u32 = 2;
+const K_FOREGROUND_APP: u32 = 1;
+
+/// 提升為 foreground GUI app，讓游標 freeze/hide 生效。冪等，啟動時呼叫一次。
+fn become_gui_app() {
+    unsafe {
+        let psn = ProcessSerialNumber {
+            high_long_of_psn: 0,
+            low_long_of_psn: K_CURRENT_PROCESS,
+        };
+        let r = TransformProcessType(&psn, K_FOREGROUND_APP);
+        tracing::info!(transform_ret = r, "TransformProcessType → foreground GUI app");
+    }
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -50,6 +76,8 @@ impl MacCapture {
 
 impl InputCapture for MacCapture {
     fn start(&mut self, tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
+        // 必須在 spawn capture thread 前（主執行緒）提升為 GUI app，游標控制才生效。
+        become_gui_app();
         let grab = self.grab.clone();
         // CGEventTap + CFRunLoop 必須在自己的 thread 跑（run loop 阻塞）。
         thread::Builder::new()
@@ -63,14 +91,16 @@ impl InputCapture for MacCapture {
         unsafe {
             if grab {
                 // 解除連動 → 系統游標 freeze（delta 仍會進 event tap）+ 隱藏。
-                CGAssociateMouseAndMouseCursorPosition(0);
-                CGDisplayHideCursor(CGMainDisplayID());
+                let a = CGAssociateMouseAndMouseCursorPosition(0);
+                let h = CGDisplayHideCursor(CGMainDisplayID());
+                tracing::info!(assoc_ret = a, hide_ret = h, "grab ON (0=success)");
             } else {
                 // 先 warp 回中央（避免一放開又落在 enter 邊緣反覆觸發），再恢復連動 + 顯示。
                 let c = CGPoint::new(self.screen.0 / 2.0, self.screen.1 / 2.0);
-                CGWarpMouseCursorPosition(c);
-                CGAssociateMouseAndMouseCursorPosition(1);
-                CGDisplayShowCursor(CGMainDisplayID());
+                let w = CGWarpMouseCursorPosition(c);
+                let a = CGAssociateMouseAndMouseCursorPosition(1);
+                let s = CGDisplayShowCursor(CGMainDisplayID());
+                tracing::info!(warp_ret = w, assoc_ret = a, show_ret = s, "grab OFF");
             }
         }
     }
@@ -105,6 +135,18 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>) {
                 let _ = tx.send(ev);
             }
             if g {
+                // disassociate/hide 在 CLI process 不可靠 → 用 warp 強制把游標釘回中心。
+                // delta 已由 translate 從事件讀出（不受 warp 影響）；warp 到「已在的位置」
+                // 不再產生事件，故不會無限迴圈。
+                if matches!(
+                    etype,
+                    CGEventType::MouseMoved
+                        | CGEventType::LeftMouseDragged
+                        | CGEventType::RightMouseDragged
+                        | CGEventType::OtherMouseDragged
+                ) {
+                    unsafe { CGWarpMouseCursorPosition(CGPoint::new(w / 2.0, h / 2.0)) };
+                }
                 CallbackResult::Drop
             } else {
                 CallbackResult::Keep
