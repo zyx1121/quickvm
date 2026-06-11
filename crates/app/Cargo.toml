@@ -20,6 +20,19 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 dirs = "5.0"
 
-# GUI subsystem 下接回父 console 用（見 main.rs attach_parent_console）。
+# GUI subsystem 下接回父 console（main.rs）+ CF_HDROP 檔案剪貼簿（clipboard_files.rs）。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+] }
+
+# 檔案剪貼簿（NSPasteboard file URLs，arboard 不支援 file list）。
+# 版本對齊 enigo 既有的 objc2 生態，不增加重複編譯。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSURL", "NSEnumerator"] }

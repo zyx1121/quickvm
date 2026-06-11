@@ -4,8 +4,39 @@
 use quickvm_event::{Control, Event};
 use serde::{Deserialize, Serialize};
 
-/// 剪貼簿同步上限。超過不送（不截斷 —— 截斷的半截內容貼出去比沒同步更糟）。
+/// 剪貼簿文字上限。超過不送（不截斷 —— 截斷的半截內容貼出去比沒同步更糟）。
 pub const CLIPBOARD_MAX: usize = 1 << 20; // 1 MiB
+
+/// 剪貼簿檔案總量上限。檔案內容走 streaming（不全載記憶體），上限擋的是
+/// 「同步一次佔線太久 + 對端暫存盤爆」，不是 frame 大小。
+pub const FILES_MAX_TOTAL: u64 = 256 << 20; // 256 MiB
+
+/// uni stream 第一個 byte：頻道 tag。0x00 = 單則 postcard `Reliable`（小訊息），
+/// 0x01 = 檔案傳輸（`FilesHeader` + 各檔 raw bytes 串接，見 transport）。
+pub const STREAM_TAG_MSG: u8 = 0x00;
+pub const STREAM_TAG_FILES: u8 = 0x01;
+
+/// 檔案傳輸 stream 的 header（tag byte 之後、內容串流之前）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilesHeader {
+    pub files: Vec<FileMeta>,
+}
+
+/// 單一檔案的傳輸 metadata。`name` 只允許檔名本體（接收端仍會 sanitize，
+/// 防 path traversal）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileMeta {
+    pub name: String,
+    pub size: u64,
+}
+
+pub fn encode_files_header(h: &FilesHeader) -> Vec<u8> {
+    postcard::to_allocvec(h).expect("encode files header")
+}
+
+pub fn decode_files_header(buf: &[u8]) -> anyhow::Result<FilesHeader> {
+    Ok(postcard::from_bytes(buf)?)
+}
 
 /// 走 reliable stream 的訊息。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

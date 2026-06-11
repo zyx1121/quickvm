@@ -6,16 +6,6 @@
 //! 絕不影響 KVM 主流程。
 
 use quickvm_proto::CLIPBOARD_MAX;
-use std::hash::{DefaultHasher, Hash, Hasher};
-
-/// 內容指紋，去重用（只在 process 內比對，兩端各自記各自的）。
-/// 同步過的內容不重送 / 不重寫 —— 否則每次切換都覆寫對端剪貼簿（擾動 clipboard
-/// history），回送再觸發回聲。
-pub fn fingerprint(text: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
-}
 
 /// 讀本機剪貼簿文字。空 / 非文字 / 超過 `CLIPBOARD_MAX` / 讀取失敗都回 `None`。
 pub async fn read_text() -> Option<String> {
@@ -47,16 +37,4 @@ pub async fn write_text(text: String) {
         }
     })
     .await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fingerprint_dedups() {
-        assert_eq!(fingerprint("hello"), fingerprint("hello"));
-        assert_ne!(fingerprint("hello"), fingerprint("hello "));
-        assert_eq!(fingerprint("中文 emoji 🦀"), fingerprint("中文 emoji 🦀"));
-    }
 }

@@ -10,6 +10,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod clipboard;
+mod clipboard_files;
 mod config;
 
 use anyhow::{Context, Result};
@@ -89,6 +90,7 @@ fn load_secret() -> Result<Vec<u8>> {
 async fn run_serve(bind: SocketAddr) -> Result<()> {
     let secret = load_secret()?;
     let mut emu = EnigoEmulator::new()?;
+    quickvm_transport::clean_recv_root();
     let mut rx = serve(bind, secret).await?;
     // 回送句柄（Leave 時回推剪貼簿）+ 已同步指紋（避免重複互寫 / 回聲）。
     let mut back: Option<BackLink> = None;
@@ -101,9 +103,16 @@ async fn run_serve(bind: SocketAddr) -> Result<()> {
             Incoming::Reliable(Reliable::Input(ev)) => emu.emit(&ev)?,
             // 主控端推來的剪貼簿 → 寫進本機。
             Incoming::Reliable(Reliable::Clipboard(text)) => {
-                last_synced = Some(clipboard::fingerprint(&text));
+                last_synced = Some(clipboard_files::fingerprint_text(&text));
                 clipboard::write_text(text).await;
                 tracing::info!("剪貼簿已同步（主控端 → 本機）");
+            }
+            // 主控端推來的檔案（內容已落地暫存）→ 剪貼簿指過去。
+            Incoming::Files(paths) => {
+                last_synced = Some(clipboard_files::fingerprint(&paths));
+                let n = paths.len();
+                clipboard_files::write_files(paths).await;
+                tracing::info!(files = n, "檔案剪貼簿已同步（主控端 → 本機）");
             }
             Incoming::Reliable(Reliable::Control(c)) => match c {
                 // 進入：定位游標到進入點，並同步主控端當下按住的修飾鍵（避免黏鍵 / 漏修飾）。
@@ -136,13 +145,29 @@ async fn run_serve(bind: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-/// 被控端 Leave 時回推剪貼簿：讀本機，內容跟上次同步不同才送（失敗只 log，不中斷 serve）。
+/// 被控端 Leave 時回推剪貼簿（檔案優先，再文字）：跟上次同步不同才送。
+/// 檔案大、傳輸久 —— spawn 背景送，不卡 serve loop 處理下一次 Enter。
 async fn sync_clipboard_back(back: Option<&BackLink>, last_synced: &mut Option<u64>) {
     let Some(bl) = back else { return };
+    if let Some(paths) = clipboard_files::read_files().await {
+        let fp = clipboard_files::fingerprint(&paths);
+        if *last_synced == Some(fp) {
+            return;
+        }
+        *last_synced = Some(fp);
+        let bl = bl.clone();
+        tokio::spawn(async move {
+            match bl.send_files(&paths).await {
+                Ok(()) => tracing::info!(files = paths.len(), "檔案已回送（本機 → 主控端）"),
+                Err(e) => tracing::warn!(error = %e, "檔案回送失敗"),
+            }
+        });
+        return;
+    }
     let Some(text) = clipboard::read_text().await else {
         return;
     };
-    let fp = clipboard::fingerprint(&text);
+    let fp = clipboard_files::fingerprint_text(&text);
     if *last_synced == Some(fp) {
         return;
     }
@@ -165,6 +190,7 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
     };
 
     let secret = load_secret()?;
+    quickvm_transport::clean_recv_root();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut cap = default_capture();
     cap.start(tx)?;
@@ -204,7 +230,7 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
 async fn drive(
     mut link: quickvm_transport::Link,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    back_rx: &mut tokio::sync::mpsc::Receiver<Reliable>,
+    back_rx: &mut tokio::sync::mpsc::Receiver<Incoming>,
     cfg: &Config,
     cap: &mut dyn quickvm_capture::InputCapture,
     last_synced: &mut Option<u64>,
@@ -239,10 +265,22 @@ async fn drive(
                             cap.set_grab(true);
                             target = Target::Remote;
                             tracing::info!(ex, ey, "→ 進入對端");
-                            // 剪貼簿跟著切換推過去（沒變不重送）。Enter 先送顧切換體感；
-                            // uni stream 間無順序保證，但人手按貼上遠慢於這幾 ms，無妨。
-                            if let Some(text) = clipboard::read_text().await {
-                                let fp = clipboard::fingerprint(&text);
+                            // 剪貼簿跟著切換推過去（沒變不重送），檔案優先於文字。
+                            // Enter 先送顧切換體感；檔案大、傳輸久 → spawn 背景送不卡 loop。
+                            if let Some(paths) = clipboard_files::read_files().await {
+                                let fp = clipboard_files::fingerprint(&paths);
+                                if *last_synced != Some(fp) {
+                                    *last_synced = Some(fp);
+                                    let fl = link.files_link();
+                                    tokio::spawn(async move {
+                                        match fl.send_files(&paths).await {
+                                            Ok(()) => tracing::info!(files = paths.len(), "檔案已推送（本機 → 被控端）"),
+                                            Err(e) => tracing::warn!(error = %e, "檔案推送失敗"),
+                                        }
+                                    });
+                                }
+                            } else if let Some(text) = clipboard::read_text().await {
+                                let fp = clipboard_files::fingerprint_text(&text);
                                 if *last_synced != Some(fp) {
                                     *last_synced = Some(fp);
                                     link.send_reliable(&Reliable::Clipboard(text)).await?;
@@ -282,16 +320,22 @@ async fn drive(
                     link.send_motion(x / cfg.remote.width, y / cfg.remote.height)?;
                 }
             }
-            // 被控端的回送（Leave 時回推剪貼簿）。channel 關閉 = 連線死，
+            // 被控端的回送（Leave 時回推剪貼簿 / 檔案）。channel 關閉 = 連線死，
             // 回 Err 走外層重連 —— 不能留在 select 裡（closed channel 立即 ready → busy loop）。
             maybe = back_rx.recv() => {
                 match maybe {
-                    Some(Reliable::Clipboard(text)) => {
-                        *last_synced = Some(clipboard::fingerprint(&text));
+                    Some(Incoming::Reliable(Reliable::Clipboard(text))) => {
+                        *last_synced = Some(clipboard_files::fingerprint_text(&text));
                         clipboard::write_text(text).await;
                         tracing::info!("剪貼簿已同步（被控端 → 本機）");
                     }
-                    Some(_) => {} // 被控端目前只回送剪貼簿
+                    Some(Incoming::Files(paths)) => {
+                        *last_synced = Some(clipboard_files::fingerprint(&paths));
+                        let n = paths.len();
+                        clipboard_files::write_files(paths).await;
+                        tracing::info!(files = n, "檔案剪貼簿已同步（被控端 → 本機）");
+                    }
+                    Some(_) => {} // 其餘 variant 不會從回送通道出現
                     None => anyhow::bail!("回送 channel 關閉（連線結束）"),
                 }
             }
