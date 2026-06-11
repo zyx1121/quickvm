@@ -1015,6 +1015,7 @@ dependencies = [
  "anyhow",
  "core-foundation",
  "core-graphics",
+ "foreign-types",
  "quickvm-event",
  "tokio",
  "tracing",

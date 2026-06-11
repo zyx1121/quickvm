@@ -42,7 +42,7 @@ enum Cmd {
     },
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     match Cli::parse().cmd {
@@ -86,59 +86,98 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut cap = default_capture();
     cap.start(tx)?;
-    let mut link = connect(addr).await?;
-    tracing::info!(%addr, side = ?cfg.remote.side, "connect (主控端) — 邊緣切換已啟用（Ctrl+C 結束）");
 
+    // 斷線自動重連：WiFi 抖動 / 睡眠喚醒 / serve 重啟都會讓 QUIC 判死，不該要求手動重起。
+    loop {
+        let link = match connect(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(error = %e, "連不上被控端，2 秒後重試…");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        tracing::info!(%addr, side = ?cfg.remote.side, "connect (主控端) — 邊緣切換已啟用（Ctrl+C 結束）");
+        if let Err(e) = drive(link, &mut rx, &cfg, cap.as_mut()).await {
+            // 斷線必須交還本機（ungrab）—— 否則 Remote 狀態下本機輸入持續被吞，Mac 整台鎖死。
+            cap.set_grab(false);
+            tracing::warn!(error = %e, "連線中斷 — 已交還本機，重連中…");
+        }
+    }
+}
+
+/// 一條連線存活期間的事件迴圈；連線層錯誤回 Err 交給外層重連。
+async fn drive(
+    mut link: quickvm_transport::Link,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    cfg: &Config,
+    cap: &mut dyn quickvm_capture::InputCapture,
+) -> Result<()> {
     let mut target = Target::Local;
     // Remote 模式下的虛擬游標（對端像素座標）。
     let (mut vx, mut vy) = (0.0_f64, 0.0_f64);
     let mut mods = Modifiers::default();
+    // 待送的最新虛擬游標：capture 高頻更新它，固定 tick 才送出 → coalesce 掉中間點，
+    // WiFi spike 時不會把積壓的舊位置全噴出去，spike 一過直接跳最新。
+    let mut pending: Option<(f64, f64)> = None;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(8)); // 125Hz
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    while let Some(ev) = rx.recv().await {
-        match target {
-            // 本機自用：只看滑鼠絕對位置有沒有撞到「朝向對端」的邊緣。
-            Target::Local => {
-                if let Event::Key { usage, dir } = ev {
-                    update_mods(&mut mods, usage, dir); // Local：鍵盤不轉發（吞掉）
-                }
-                if let Event::MotionAbs { x, y } = ev {
-                    if let Some((ex, ey)) = enter_point(cfg.remote.side, x, y) {
-                        vx = ex * cfg.remote.width;
-                        vy = ey * cfg.remote.height;
-                        link.send_reliable(&Reliable::Control(Control::Enter { x: ex, y: ey, mods }))
-                            .await?;
-                        cap.set_grab(true);
-                        target = Target::Remote;
-                        tracing::info!(ex, ey, "→ 進入對端");
+    loop {
+        tokio::select! {
+            // 公平輪詢：不能 biased，否則高頻事件會餓死 ticker → pending 永不送、游標不動。
+            maybe = rx.recv() => {
+                let Some(ev) = maybe else { anyhow::bail!("capture channel closed") };
+                match target {
+                    // 本機自用：只看滑鼠絕對位置有沒有撞到「朝向對端」的邊緣。
+                    Target::Local => {
+                        if let Event::Key { usage, dir } = ev {
+                            update_mods(&mut mods, usage, dir); // Local：鍵盤不轉發（吞掉）
+                        }
+                        if let Event::MotionAbs { x, y } = ev {
+                            if let Some((ex, ey)) = enter_point(cfg.remote.side, x, y) {
+                                vx = ex * cfg.remote.width;
+                                vy = ey * cfg.remote.height;
+                                link.send_reliable(&Reliable::Control(Control::Enter { x: ex, y: ey, mods })).await?;
+                                cap.set_grab(true);
+                                target = Target::Remote;
+                                tracing::info!(ex, ey, "→ 進入對端");
+                            }
+                        }
                     }
+                    // 控制對端：累積相對位移算虛擬游標，撞回反向邊緣則交還本機。
+                    Target::Remote => match ev {
+                        Event::MotionRel { dx, dy } => {
+                            vx += dx;
+                            vy += dy;
+                            if left_remote(cfg.remote.side, vx, vy, cfg.remote.width, cfg.remote.height) {
+                                link.send_reliable(&Reliable::Control(Control::Leave)).await?;
+                                cap.set_grab(false);
+                                target = Target::Local;
+                                pending = None;
+                                tracing::info!("← 交還本機");
+                            } else {
+                                vx = vx.clamp(0.0, cfg.remote.width);
+                                vy = vy.clamp(0.0, cfg.remote.height);
+                                pending = Some((vx, vy)); // 不立即送，等 tick coalesce
+                            }
+                        }
+                        Event::Key { usage, dir } => {
+                            update_mods(&mut mods, usage, dir);
+                            link.send_reliable(&Reliable::Input(Event::Key { usage, dir })).await?;
+                        }
+                        Event::MotionAbs { .. } => {} // grab 模式不該出現
+                        other => link.send_reliable(&Reliable::Input(other)).await?,
+                    },
                 }
             }
-            // 控制對端：累積相對位移算虛擬游標，撞回反向邊緣則交還本機。
-            Target::Remote => match ev {
-                Event::MotionRel { dx, dy } => {
-                    vx += dx;
-                    vy += dy;
-                    if left_remote(cfg.remote.side, vx, vy, cfg.remote.width, cfg.remote.height) {
-                        link.send_reliable(&Reliable::Control(Control::Leave)).await?;
-                        cap.set_grab(false);
-                        target = Target::Local;
-                        tracing::info!("← 交還本機");
-                    } else {
-                        vx = vx.clamp(0.0, cfg.remote.width);
-                        vy = vy.clamp(0.0, cfg.remote.height);
-                        link.send_motion(vx / cfg.remote.width, vy / cfg.remote.height)?;
-                    }
+            _ = ticker.tick() => {
+                if let Some((x, y)) = pending.take() {
+                    link.send_motion(x / cfg.remote.width, y / cfg.remote.height)?;
                 }
-                Event::Key { usage, dir } => {
-                    update_mods(&mut mods, usage, dir);
-                    link.send_reliable(&Reliable::Input(Event::Key { usage, dir })).await?;
-                }
-                Event::MotionAbs { .. } => {} // grab 模式不該出現
-                other => link.send_reliable(&Reliable::Input(other)).await?,
-            },
+            }
         }
     }
-    Ok(())
 }
 
 enum Target {

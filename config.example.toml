@@ -4,6 +4,8 @@
 # side 描述對端(remote)相對本機(local)的方位：left / right / top / bottom。
 #   side = "right" → 對端在本機右邊 → 推到本機右緣穿過去、在對端推回左緣切回來。
 
+# 被控端有多介面時挑延遲低的那條：走乙太的 IP 比走 WiFi 的少一段無線、jitter 較低。
+# （但主控端 Mac 若也是 WiFi，那段仍是共同瓶頸 — 最穩是兩端都乙太。可用 --server 臨時覆蓋比較。）
 server = "192.168.1.120:7777"
 
 [local]   # 本機 (Mac) 螢幕像素尺寸
