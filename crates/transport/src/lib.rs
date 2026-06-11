@@ -4,9 +4,11 @@
 //! TODO(perf): CC 換 BBR / 調大 initial cwnd —— loss-based CC 在 WiFi 丟包會收縮、反增延遲。
 
 use anyhow::Result;
+use hmac::{Hmac, Mac};
 use quickvm_proto::{
     decode_motion, decode_reliable, encode_motion, encode_reliable, Motion, Reliable,
 };
+use sha2::Sha256;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -21,6 +23,8 @@ const MAX_FRAME: usize = 64 * 1024;
 pub enum Incoming {
     Reliable(Reliable),
     Motion(Motion),
+    /// 連線結束 —— 被控端據此 release 所有按住的鍵，避免主控斷線後黏鍵。
+    Disconnected,
 }
 
 /// rustls 0.23 需要 process-level crypto provider（冪等）。
@@ -32,7 +36,12 @@ fn server_config() -> Result<ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec!["quickvm".to_string()])?;
     let cert_der = cert.cert.der().clone();
     let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    Ok(ServerConfig::with_single_cert(vec![cert_der], key_der.into())?)
+    let mut sc = ServerConfig::with_single_cert(vec![cert_der], key_der.into())?;
+    // 明設 idle timeout，跟 client keep-alive(5s) 對齊，不靠 quinn 預設。
+    let mut tc = quinn::TransportConfig::default();
+    tc.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into()?));
+    sc.transport_config(Arc::new(tc));
+    Ok(sc)
 }
 
 fn client_config() -> Result<ClientConfig> {
@@ -46,20 +55,34 @@ fn client_config() -> Result<ClientConfig> {
     // 單端開即可（PING 往返重置雙方 idle timer）；interval 須 < server 預設 idle (~30s)。
     let mut tc = quinn::TransportConfig::default();
     tc.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    tc.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into()?));
     cc.transport_config(Arc::new(tc));
     Ok(cc)
 }
 
-/// 被控端：監聽，接受連線，把收到的事件推進 channel。
-pub async fn serve(bind: SocketAddr) -> Result<mpsc::Receiver<Incoming>> {
+/// 被控端：監聽，接受連線，PSK 認證通過後把收到的事件推進 channel。
+pub async fn serve(bind: SocketAddr, secret: Vec<u8>) -> Result<mpsc::Receiver<Incoming>> {
     install_crypto();
     let ep = Endpoint::server(server_config()?, bind)?;
     let (tx, rx) = mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let Ok(conn) = incoming.await else { continue };
-            tracing::info!(peer = %conn.remote_address(), "controller connected");
-            spawn_recv(conn, tx.clone());
+            let tx = tx.clone();
+            let secret = secret.clone();
+            // 每條連線獨立認證，避免一個慢/惡意 handshake 卡住 accept loop。
+            tokio::spawn(async move {
+                match server_handshake(&conn, &secret).await {
+                    Ok(()) => {
+                        tracing::info!(peer = %conn.remote_address(), "controller authenticated");
+                        spawn_recv(conn, tx);
+                    }
+                    Err(e) => {
+                        tracing::warn!(peer = %conn.remote_address(), error = %e, "認證失敗，拒絕連線");
+                        conn.close(1u32.into(), b"auth failed");
+                    }
+                }
+            });
         }
     });
     Ok(rx)
@@ -81,28 +104,70 @@ fn spawn_recv(conn: Connection, tx: mpsc::Sender<Incoming>) {
             }
         }
     });
-    // uni stream（鍵盤 / 按鈕 / 捲動 / 控制）—— 每則一條 stream
+    // uni stream（鍵盤 / 按鈕 / 捲動 / 控制）—— 每則一條 stream。
+    // accept_uni 出錯 = 連線結束 → 通知被控端 release 按住的鍵。
     tokio::spawn(async move {
         while let Ok(mut recv) = conn.accept_uni().await {
-            if let Ok(buf) = recv.read_to_end(MAX_FRAME).await {
-                if let Ok(r) = decode_reliable(&buf) {
-                    let _ = tx.send(Incoming::Reliable(r)).await;
-                }
+            if let Ok(buf) = recv.read_to_end(MAX_FRAME).await
+                && let Ok(r) = decode_reliable(&buf)
+            {
+                let _ = tx.send(Incoming::Reliable(r)).await;
             }
         }
+        let _ = tx.send(Incoming::Disconnected).await;
     });
 }
 
-/// 主控端：連到被控端。
-pub async fn connect(addr: SocketAddr) -> Result<Link> {
+/// 主控端：連到被控端，通過 PSK 認證後回傳連線句柄。
+pub async fn connect(addr: SocketAddr, secret: Vec<u8>) -> Result<Link> {
     install_crypto();
     let mut ep = Endpoint::client("0.0.0.0:0".parse()?)?;
     ep.set_default_client_config(client_config()?);
     let conn = ep.connect(addr, "quickvm")?.await?;
+    client_handshake(&conn, &secret).await?;
     Ok(Link {
         conn,
         motion_seq: 0,
     })
+}
+
+/// PSK challenge-response（HMAC-SHA256）。傳輸已 TLS 加密，但 skip-verify 不防 MITM，
+/// 故 secret 不直接上線：serve 出 nonce、client 回 HMAC(secret, nonce)，serve 驗。
+/// 擋掉「任何人連上就能注入鍵鼠」這個主威脅；MITM 重放被 per-連線新 nonce 擋掉。
+const HS_NONCE_LEN: usize = 32;
+const HS_MAC_LEN: usize = 32; // HMAC-SHA256 輸出長度
+
+fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; HS_MAC_LEN] {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret).expect("HMAC 接受任意長度 key");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+async fn server_handshake(conn: &Connection, secret: &[u8]) -> Result<()> {
+    use rand::RngCore;
+    let mut nonce = [0u8; HS_NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let mut s = conn.open_uni().await?;
+    s.write_all(&nonce).await?;
+    s.finish()?;
+    let mut r = conn.accept_uni().await?;
+    let received = r.read_to_end(HS_MAC_LEN).await?;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret).expect("HMAC key");
+    mac.update(&nonce);
+    // verify_slice 是 constant-time 比較，避免 timing attack。
+    mac.verify_slice(&received)
+        .map_err(|_| anyhow::anyhow!("HMAC 不符 —— 共享密鑰不一致"))?;
+    Ok(())
+}
+
+async fn client_handshake(conn: &Connection, secret: &[u8]) -> Result<()> {
+    let mut r = conn.accept_uni().await?;
+    let nonce = r.read_to_end(HS_NONCE_LEN).await?;
+    let mac = hmac_sha256(secret, &nonce);
+    let mut s = conn.open_uni().await?;
+    s.write_all(&mac).await?;
+    s.finish()?;
+    Ok(())
 }
 
 /// 連線句柄：送可靠訊息 / 送指標 datagram。
