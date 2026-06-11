@@ -12,6 +12,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacCapture;
 
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::WinCapture;
+
 /// 捕捉後端。
 pub trait InputCapture: Send {
     /// 啟動捕捉，事件送進 channel。
@@ -20,13 +25,17 @@ pub trait InputCapture: Send {
     fn set_grab(&mut self, grab: bool);
 }
 
-/// 當前平台的捕捉後端：macOS = CGEventTap，其他 = ManualCapture stub。
+/// 當前平台的捕捉後端：macOS = CGEventTap、Windows = WH_*_LL hook、其他 = ManualCapture stub。
 pub fn default_capture() -> Box<dyn InputCapture> {
     #[cfg(target_os = "macos")]
     {
         Box::new(MacCapture::new())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(WinCapture::new())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Box::new(ManualCapture::new())
     }
