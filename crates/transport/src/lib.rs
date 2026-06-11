@@ -134,6 +134,7 @@ pub async fn connect(addr: SocketAddr, secret: Vec<u8>) -> Result<Link> {
 /// PSK challenge-response（HMAC-SHA256）。傳輸已 TLS 加密，但 skip-verify 不防 MITM，
 /// 故 secret 不直接上線：serve 出 nonce、client 回 HMAC(secret, nonce)，serve 驗。
 /// 擋掉「任何人連上就能注入鍵鼠」這個主威脅；MITM 重放被 per-連線新 nonce 擋掉。
+const HS_VERSION: u8 = 1;
 const HS_NONCE_LEN: usize = 32;
 const HS_MAC_LEN: usize = 32; // HMAC-SHA256 輸出長度
 
@@ -143,31 +144,50 @@ fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; HS_MAC_LEN] {
     mac.finalize().into_bytes().into()
 }
 
+// 用單一 bi stream（順序保證）：client 送版本 → serve 出 nonce → client 回 HMAC →
+// serve 驗並回 1 byte verdict。client 必須等到 verdict 才算認證成功，否則錯 secret
+// 會被 client 當成已連上、直到下次操作才斷。
 async fn server_handshake(conn: &Connection, secret: &[u8]) -> Result<()> {
     use rand::RngCore;
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let mut ver = [0u8; 1];
+    recv.read_exact(&mut ver).await?;
+    if ver[0] != HS_VERSION {
+        anyhow::bail!("協定版本不符（{} != {}）", ver[0], HS_VERSION);
+    }
     let mut nonce = [0u8; HS_NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let mut s = conn.open_uni().await?;
-    s.write_all(&nonce).await?;
-    s.finish()?;
-    let mut r = conn.accept_uni().await?;
-    let received = r.read_to_end(HS_MAC_LEN).await?;
+    send.write_all(&nonce).await?;
+    let mut received = [0u8; HS_MAC_LEN];
+    recv.read_exact(&mut received).await?;
     let mut mac = <Hmac<Sha256>>::new_from_slice(secret).expect("HMAC key");
     mac.update(&nonce);
     // verify_slice 是 constant-time 比較，避免 timing attack。
-    mac.verify_slice(&received)
-        .map_err(|_| anyhow::anyhow!("HMAC 不符 —— 共享密鑰不一致"))?;
-    Ok(())
+    let ok = mac.verify_slice(&received).is_ok();
+    send.write_all(&[ok as u8]).await?;
+    send.finish()?;
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("HMAC 不符 —— 共享密鑰不一致")
+    }
 }
 
 async fn client_handshake(conn: &Connection, secret: &[u8]) -> Result<()> {
-    let mut r = conn.accept_uni().await?;
-    let nonce = r.read_to_end(HS_NONCE_LEN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&[HS_VERSION]).await?;
+    let mut nonce = [0u8; HS_NONCE_LEN];
+    recv.read_exact(&mut nonce).await?;
     let mac = hmac_sha256(secret, &nonce);
-    let mut s = conn.open_uni().await?;
-    s.write_all(&mac).await?;
-    s.finish()?;
-    Ok(())
+    send.write_all(&mac).await?;
+    send.finish()?;
+    let mut verdict = [0u8; 1];
+    recv.read_exact(&mut verdict).await?;
+    if verdict[0] == 1 {
+        Ok(())
+    } else {
+        anyhow::bail!("認證被拒 —— 共享密鑰不符")
+    }
 }
 
 /// 連線句柄：送可靠訊息 / 送指標 datagram。
