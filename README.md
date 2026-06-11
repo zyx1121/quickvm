@@ -11,7 +11,7 @@
 
 > A QUIC-based software KVM — drive your Windows box with your Mac's keyboard and mouse, switch by shoving the cursor across the screen edge. Keyboard rides a reliable stream, mouse motion rides unreliable datagrams: low latency, no TCP head-of-line blocking.
 
-`QUIC transport` · `screen-edge switching` · `HID-usage keymap` · `cursor grab + warp` · `Rust`
+`QUIC transport` · `screen-edge switching` · `HID-usage keymap` · `cursor grab + warp` · `clipboard sync` · `Rust`
 
 [![Rust](https://img.shields.io/badge/Rust-2024-dea584)](https://www.rust-lang.org) &nbsp;[![platform](https://img.shields.io/badge/macOS-→%20Windows-111111)](#status) &nbsp;[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](#license)
 
@@ -99,7 +99,7 @@ Both machines on the same LAN. Push the cursor off the configured edge to start 
 Rust workspace, layered after [lan-mouse](https://github.com/feschber/lan-mouse):
 
 - **`event`** — platform-agnostic input model; **USB HID usage** is the key-code anchor (not OS keycodes), so all platforms map symmetrically
-- **`proto`** — [postcard](https://crates.io/crates/postcard) wire format; reliable (key / button / scroll / control) vs datagram (motion) split
+- **`proto`** — [postcard](https://crates.io/crates/postcard) wire format; reliable (key / button / scroll / control / clipboard) vs datagram (motion) split
 - **`transport`** — [quinn](https://crates.io/crates/quinn) QUIC; self-signed cert + skip-verify *(TODO: SSH-like fingerprint)*, keep-alive, stale-datagram drop
 - **`capture`** — `InputCapture` trait; macOS `CGEventTap` backend with cursor grab, others stub
 - **`emulation`** — `InputEmulator` trait; [enigo](https://crates.io/crates/enigo) backend *(v2: virtual-HID for UAC prompts / password fields)*
@@ -137,6 +137,15 @@ QUIC/TLS encrypts the link, but the client uses skip-verify (no cert pinning yet
 </details>
 
 <details>
+<summary><b>Clipboard sync</b></summary>
+
+Text clipboard follows the edge switch, both ways: crossing **into** the remote pushes the controller's clipboard to it; crossing **back** pulls whatever you copied over there. No always-on clipboard watching — macOS has no pasteboard-change callback (polling only), and syncing at the switch covers the actual KVM flow (you copy, then you shove the cursor across to paste). Same trigger Deskflow uses.
+
+Implementation notes: content rides the existing reliable stream as a new `Clipboard` message (the wire bump is why `HS_VERSION` is 2); the controlled side answers `Leave` by pushing its clipboard back on a server→client uni stream. Both ends keep a content fingerprint and skip the send when nothing changed — re-pushing identical content would stomp the far side's clipboard history on every switch. Text-only for now, 1 MiB cap (oversized content is skipped, never truncated — half a paste is worse than none), and any clipboard failure degrades silently rather than touching the input path.
+
+</details>
+
+<details>
 <summary><b>Transport & latency</b></summary>
 
 Motion goes over **unreliable datagrams** (a dropped one is self-healing — the next absolute position corrects it); keys/buttons/scroll/control go over **reliable streams** (a lost key-up is a stuck key). The controller samples its virtual cursor at a fixed **125 Hz tick** and sends only the latest position, so a Wi-Fi latency spike never flushes a backlog of stale coordinates. The runtime is multi-threaded so the QUIC driver isn't starved by the input loop.
@@ -149,7 +158,9 @@ Residual latency is dominated by the **controller's Wi-Fi link** (RTT base drift
 
 - [x] Screen-edge enter/leave + input swallow (real KVM feel)
 - [x] Cursor grab/freeze, modifiers, auto-reconnect, fixed-tick motion coalescing
+- [x] Clipboard sync (text, both directions, synced on edge switch)
 - [ ] Windows capture (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) for bidirectional control
+- [ ] Clipboard v2: images / files
 - [ ] Proportional screen mapping (portrait Mac vs landscape Windows aren't equal-ratio yet)
 - [ ] SSH-like cert fingerprint trust (replace skip-verify); CC tuning (BBR / larger initial cwnd)
 - [ ] `serve` as a persistent / boot-start service

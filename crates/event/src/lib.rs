@@ -29,7 +29,6 @@ impl Modifiers {
     pub const SHIFT: u16 = 1 << 1;
     pub const ALT: u16 = 1 << 2; // mac: Option
     pub const META: u16 = 1 << 3; // mac: Command / win: Win
-
 }
 
 /// 一個輸入事件。

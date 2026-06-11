@@ -6,25 +6,47 @@
 use anyhow::Result;
 use hmac::{Hmac, Mac};
 use quickvm_proto::{
-    decode_motion, decode_reliable, encode_motion, encode_reliable, Motion, Reliable,
+    Motion, Reliable, decode_motion, decode_reliable, encode_motion, encode_reliable,
 };
-use sha2::Sha256;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use sha2::Sha256;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-const MAX_FRAME: usize = 64 * 1024;
+// reliable frame 上限：要容得下剪貼簿訊息（CLIPBOARD_MAX + postcard enum/長度 overhead）。
+const MAX_FRAME: usize = quickvm_proto::CLIPBOARD_MAX + 64;
 
 /// 從對端收到的一則訊息。
 #[derive(Debug)]
 pub enum Incoming {
+    /// 主控端認證通過 —— 帶回送句柄（被控端 Leave 時回推剪貼簿用）。
+    Connected(BackLink),
     Reliable(Reliable),
     Motion(Motion),
     /// 連線結束 —— 被控端據此 release 所有按住的鍵，避免主控斷線後黏鍵。
     Disconnected,
+}
+
+/// 被控端 → 主控端的回送句柄（uni stream，與主控端送來的方向相反）。
+#[derive(Debug)]
+pub struct BackLink {
+    conn: Connection,
+}
+
+impl BackLink {
+    pub async fn send_reliable(&self, msg: &Reliable) -> Result<()> {
+        send_reliable_on(&self.conn, msg).await
+    }
+}
+
+async fn send_reliable_on(conn: &Connection, msg: &Reliable) -> Result<()> {
+    let mut s = conn.open_uni().await?;
+    s.write_all(&encode_reliable(msg)).await?;
+    s.finish()?;
+    Ok(())
 }
 
 /// rustls 0.23 需要 process-level crypto provider（冪等）。
@@ -75,6 +97,9 @@ pub async fn serve(bind: SocketAddr, secret: Vec<u8>) -> Result<mpsc::Receiver<I
                 match server_handshake(&conn, &secret).await {
                     Ok(()) => {
                         tracing::info!(peer = %conn.remote_address(), "controller authenticated");
+                        let _ = tx
+                            .send(Incoming::Connected(BackLink { conn: conn.clone() }))
+                            .await;
                         spawn_recv(conn, tx);
                     }
                     Err(e) => {
@@ -118,23 +143,42 @@ fn spawn_recv(conn: Connection, tx: mpsc::Sender<Incoming>) {
     });
 }
 
-/// 主控端：連到被控端，通過 PSK 認證後回傳連線句柄。
-pub async fn connect(addr: SocketAddr, secret: Vec<u8>) -> Result<Link> {
+/// 主控端：連到被控端，通過 PSK 認證後回傳連線句柄 + 對端回送訊息的 channel
+/// （與 `Link` 分開回傳 —— 同一個 struct 在 select! 裡同時收又送會撞 borrow）。
+pub async fn connect(
+    addr: SocketAddr,
+    secret: Vec<u8>,
+) -> Result<(Link, mpsc::Receiver<Reliable>)> {
     install_crypto();
     let mut ep = Endpoint::client("0.0.0.0:0".parse()?)?;
     ep.set_default_client_config(client_config()?);
     let conn = ep.connect(addr, "quickvm")?.await?;
     client_handshake(&conn, &secret).await?;
-    Ok(Link {
-        conn,
-        motion_seq: 0,
-    })
+    // 收被控端的回送（剪貼簿回推）。連線死亡 accept_uni 出錯 → task 結束、channel 關閉。
+    let (tx, rx) = mpsc::channel(16);
+    let c = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(mut recv) = c.accept_uni().await {
+            if let Ok(buf) = recv.read_to_end(MAX_FRAME).await
+                && let Ok(r) = decode_reliable(&buf)
+            {
+                let _ = tx.send(r).await;
+            }
+        }
+    });
+    Ok((
+        Link {
+            conn,
+            motion_seq: 0,
+        },
+        rx,
+    ))
 }
 
 /// PSK challenge-response（HMAC-SHA256）。傳輸已 TLS 加密，但 skip-verify 不防 MITM，
 /// 故 secret 不直接上線：serve 出 nonce、client 回 HMAC(secret, nonce)，serve 驗。
 /// 擋掉「任何人連上就能注入鍵鼠」這個主威脅；MITM 重放被 per-連線新 nonce 擋掉。
-const HS_VERSION: u8 = 1;
+const HS_VERSION: u8 = 2; // v2: Reliable 加 Clipboard variant + 被控端回送 stream
 const HS_NONCE_LEN: usize = 32;
 const HS_MAC_LEN: usize = 32; // HMAC-SHA256 輸出長度
 
@@ -198,10 +242,7 @@ pub struct Link {
 
 impl Link {
     pub async fn send_reliable(&self, msg: &Reliable) -> Result<()> {
-        let mut s = self.conn.open_uni().await?;
-        s.write_all(&encode_reliable(msg)).await?;
-        s.finish()?;
-        Ok(())
+        send_reliable_on(&self.conn, msg).await
     }
 
     pub fn send_motion(&mut self, x: f64, y: f64) -> Result<()> {

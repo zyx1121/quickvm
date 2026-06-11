@@ -48,8 +48,12 @@ impl Config {
     /// 從 path（或預設路徑）讀取並解析。
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let path = path.unwrap_or_else(default_path);
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("讀設定檔失敗：{}（可複製 config.example.toml）", path.display()))?;
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "讀設定檔失敗：{}（可複製 config.example.toml）",
+                path.display()
+            )
+        })?;
         toml::from_str(&text).with_context(|| format!("解析設定檔失敗：{}", path.display()))
     }
 }
