@@ -4,6 +4,7 @@
 //! 主控端跑邊緣切換狀態機：游標撞到「朝向對端那側」的螢幕邊緣才穿過去控制對端，
 //! 期間吞掉本機輸入（grab）；在對端撞回反向邊緣則交還本機。方位 / 尺寸由設定檔決定。
 
+mod clipboard;
 mod config;
 
 use anyhow::{Context, Result};
@@ -13,7 +14,7 @@ use quickvm_capture::default_capture;
 use quickvm_emulation::{EnigoEmulator, InputEmulator};
 use quickvm_event::{Control, Direction, Event, Modifiers};
 use quickvm_proto::Reliable;
-use quickvm_transport::{connect, serve, Incoming};
+use quickvm_transport::{BackLink, Incoming, connect, serve};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -71,35 +72,67 @@ async fn run_serve(bind: SocketAddr) -> Result<()> {
     let secret = load_secret()?;
     let mut emu = EnigoEmulator::new()?;
     let mut rx = serve(bind, secret).await?;
+    // 回送句柄（Leave 時回推剪貼簿）+ 已同步指紋（避免重複互寫 / 回聲）。
+    let mut back: Option<BackLink> = None;
+    let mut last_synced: Option<u64> = None;
     tracing::info!(%bind, "serve (被控端) — 等待主控連入…");
     while let Some(item) = rx.recv().await {
         match item {
+            Incoming::Connected(bl) => back = Some(bl),
             Incoming::Motion(m) => emu.emit(&Event::MotionAbs { x: m.x, y: m.y })?,
             Incoming::Reliable(Reliable::Input(ev)) => emu.emit(&ev)?,
+            // 主控端推來的剪貼簿 → 寫進本機。
+            Incoming::Reliable(Reliable::Clipboard(text)) => {
+                last_synced = Some(clipboard::fingerprint(&text));
+                clipboard::write_text(text).await;
+                tracing::info!("剪貼簿已同步（主控端 → 本機）");
+            }
             Incoming::Reliable(Reliable::Control(c)) => match c {
                 // 進入：定位游標到進入點，並同步主控端當下按住的修飾鍵（避免黏鍵 / 漏修飾）。
                 Control::Enter { x, y, mods } => {
                     emu.emit(&Event::MotionAbs { x, y })?;
                     for (bit, usage) in MODIFIER_USAGES {
                         if mods.0 & bit != 0 {
-                            emu.emit(&Event::Key { usage, dir: Direction::Press })?;
+                            emu.emit(&Event::Key {
+                                usage,
+                                dir: Direction::Press,
+                            })?;
                         }
                     }
                 }
-                // 離開：放開所有按住的鍵，控制權交還主控端。
+                // 離開：放開所有按住的鍵，控制權交還主控端，把被控期間複製的東西帶回去。
                 Control::Leave => {
                     emu.release_all()?;
+                    sync_clipboard_back(back.as_ref(), &mut last_synced).await;
                     tracing::info!("leave — 控制交還主控端");
                 }
             },
             // 主控斷線：release 殘留按鍵，等下一個主控連入。
             Incoming::Disconnected => {
                 emu.release_all()?;
+                back = None;
                 tracing::info!("主控斷線 — 已放開所有按鍵");
             }
         }
     }
     Ok(())
+}
+
+/// 被控端 Leave 時回推剪貼簿：讀本機，內容跟上次同步不同才送（失敗只 log，不中斷 serve）。
+async fn sync_clipboard_back(back: Option<&BackLink>, last_synced: &mut Option<u64>) {
+    let Some(bl) = back else { return };
+    let Some(text) = clipboard::read_text().await else {
+        return;
+    };
+    let fp = clipboard::fingerprint(&text);
+    if *last_synced == Some(fp) {
+        return;
+    }
+    *last_synced = Some(fp);
+    match bl.send_reliable(&Reliable::Clipboard(text)).await {
+        Ok(()) => tracing::info!("剪貼簿已回送（本機 → 主控端）"),
+        Err(e) => tracing::warn!(error = %e, "剪貼簿回送失敗"),
+    }
 }
 
 /// 主控端：邊緣切換狀態機。
@@ -118,9 +151,12 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
     let mut cap = default_capture();
     cap.start(tx)?;
 
+    // 已同步剪貼簿指紋：放重連 loop 外，斷線重連不重推沒變的內容。
+    let mut last_synced: Option<u64> = None;
+
     // 斷線自動重連：WiFi 抖動 / 睡眠喚醒 / serve 重啟都會讓 QUIC 判死，不該要求手動重起。
     loop {
-        let link = match connect(addr, secret.clone()).await {
+        let (link, mut back_rx) = match connect(addr, secret.clone()).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!(error = %e, "連不上被控端，2 秒後重試…");
@@ -129,7 +165,16 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
             }
         };
         tracing::info!(%addr, side = ?cfg.remote.side, "connect (主控端) — 邊緣切換已啟用（Ctrl+C 結束）");
-        if let Err(e) = drive(link, &mut rx, &cfg, cap.as_mut()).await {
+        if let Err(e) = drive(
+            link,
+            &mut rx,
+            &mut back_rx,
+            &cfg,
+            cap.as_mut(),
+            &mut last_synced,
+        )
+        .await
+        {
             // 斷線必須交還本機（ungrab）—— 否則 Remote 狀態下本機輸入持續被吞，Mac 整台鎖死。
             cap.set_grab(false);
             tracing::warn!(error = %e, "連線中斷 — 已交還本機，重連中…");
@@ -141,8 +186,10 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
 async fn drive(
     mut link: quickvm_transport::Link,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    back_rx: &mut tokio::sync::mpsc::Receiver<Reliable>,
     cfg: &Config,
     cap: &mut dyn quickvm_capture::InputCapture,
+    last_synced: &mut Option<u64>,
 ) -> Result<()> {
     let mut target = Target::Local;
     // Remote 模式下的虛擬游標（對端像素座標）。
@@ -174,6 +221,16 @@ async fn drive(
                             cap.set_grab(true);
                             target = Target::Remote;
                             tracing::info!(ex, ey, "→ 進入對端");
+                            // 剪貼簿跟著切換推過去（沒變不重送）。Enter 先送顧切換體感；
+                            // uni stream 間無順序保證，但人手按貼上遠慢於這幾 ms，無妨。
+                            if let Some(text) = clipboard::read_text().await {
+                                let fp = clipboard::fingerprint(&text);
+                                if *last_synced != Some(fp) {
+                                    *last_synced = Some(fp);
+                                    link.send_reliable(&Reliable::Clipboard(text)).await?;
+                                    tracing::info!("剪貼簿已推送（本機 → 被控端）");
+                                }
+                            }
                         }
                     }
                     // 控制對端：累積相對位移算虛擬游標，撞回反向邊緣則交還本機。
@@ -205,6 +262,19 @@ async fn drive(
             _ = ticker.tick() => {
                 if let Some((x, y)) = pending.take() {
                     link.send_motion(x / cfg.remote.width, y / cfg.remote.height)?;
+                }
+            }
+            // 被控端的回送（Leave 時回推剪貼簿）。channel 關閉 = 連線死，
+            // 回 Err 走外層重連 —— 不能留在 select 裡（closed channel 立即 ready → busy loop）。
+            maybe = back_rx.recv() => {
+                match maybe {
+                    Some(Reliable::Clipboard(text)) => {
+                        *last_synced = Some(clipboard::fingerprint(&text));
+                        clipboard::write_text(text).await;
+                        tracing::info!("剪貼簿已同步（被控端 → 本機）");
+                    }
+                    Some(_) => {} // 被控端目前只回送剪貼簿
+                    None => anyhow::bail!("回送 channel 關閉（連線結束）"),
                 }
             }
         }

@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+# default features 會拉整個 image stack（image-data）；只同步文字，不需要。
+arboard = { version = "3", default-features = false }
 clap = { version = "4.6.1", features = ["derive"] }
 quickvm-capture = { version = "0.1.0", path = "../capture" }
 quickvm-emulation = { version = "0.1.0", path = "../emulation" }

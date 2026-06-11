@@ -9,7 +9,7 @@
 
 use crate::InputCapture;
 use core_foundation::base::TCFType;
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use core_graphics::display::CGDisplay;
 use core_graphics::event::CGEvent;
 use core_graphics::event::{
@@ -231,8 +231,10 @@ fn translate(etype: CGEventType, event: &CGEvent, w: f64, h: f64) -> Option<Even
         OtherMouseDown => Some(btn(other_button(event), Direction::Press)),
         OtherMouseUp => Some(btn(other_button(event), Direction::Release)),
         ScrollWheel => {
-            let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as i32;
-            let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32;
+            let dy =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as i32;
+            let dx =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as i32;
             Some(Event::Scroll {
                 dx: dx * 120,
                 dy: dy * 120,
@@ -269,11 +271,11 @@ fn key_event(event: &CGEvent, dir: Direction) -> Option<Event> {
 /// 左右同鍵共用一個 flag（macOS flags 不分左右）—— 同時按左右同修飾鍵的 edge case 暫不處理。
 fn modifier_flag_mask(keycode: u16) -> Option<CGEventFlags> {
     Some(match keycode {
-        0x38 | 0x3C => CGEventFlags::CGEventFlagShift,     // L/R Shift
-        0x3B | 0x3E => CGEventFlags::CGEventFlagControl,   // L/R Control
+        0x38 | 0x3C => CGEventFlags::CGEventFlagShift, // L/R Shift
+        0x3B | 0x3E => CGEventFlags::CGEventFlagControl, // L/R Control
         0x3A | 0x3D => CGEventFlags::CGEventFlagAlternate, // L/R Alt/Option
-        0x37 | 0x36 => CGEventFlags::CGEventFlagCommand,   // L/R Cmd
-        0x39 => CGEventFlags::CGEventFlagAlphaShift,       // CapsLock
+        0x37 | 0x36 => CGEventFlags::CGEventFlagCommand, // L/R Cmd
+        0x39 => CGEventFlags::CGEventFlagAlphaShift,   // CapsLock
         _ => return None,
     })
 }
