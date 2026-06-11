@@ -51,22 +51,52 @@ async fn main() -> Result<()> {
     }
 }
 
+/// 共享密鑰（PSK）：兩端必須相同。從環境變數 `QUICKVM_SECRET` 讀，未設則拒絕啟動
+/// —— 沒有它就是「任何人連上即可控制本機」，不允許靜默以不安全模式跑。
+fn load_secret() -> Result<Vec<u8>> {
+    let s = std::env::var("QUICKVM_SECRET").map_err(|_| {
+        anyhow::anyhow!(
+            "未設 QUICKVM_SECRET —— 兩端需設相同的共享密鑰（建議 32+ 字元隨機字串）。\n\
+             例：export QUICKVM_SECRET=\"$(openssl rand -hex 32)\""
+        )
+    })?;
+    if s.len() < 16 {
+        anyhow::bail!("QUICKVM_SECRET 太短（<16 字元），請用更長的隨機字串");
+    }
+    Ok(s.into_bytes())
+}
+
 /// 被控端：注入收到的事件。
 async fn run_serve(bind: SocketAddr) -> Result<()> {
+    let secret = load_secret()?;
     let mut emu = EnigoEmulator::new()?;
-    let mut rx = serve(bind).await?;
+    let mut rx = serve(bind, secret).await?;
     tracing::info!(%bind, "serve (被控端) — 等待主控連入…");
     while let Some(item) = rx.recv().await {
         match item {
             Incoming::Motion(m) => emu.emit(&Event::MotionAbs { x: m.x, y: m.y })?,
             Incoming::Reliable(Reliable::Input(ev)) => emu.emit(&ev)?,
             Incoming::Reliable(Reliable::Control(c)) => match c {
-                // 進入：把游標定位到進入點，承接後續鍵鼠。
-                Control::Enter { x, y, .. } => emu.emit(&Event::MotionAbs { x, y })?,
-                // 離開：控制權交還主控端（TODO: release 所有按鍵避免黏鍵）。
-                Control::Leave => tracing::info!("leave — 控制交還主控端"),
-                _ => {}
+                // 進入：定位游標到進入點，並同步主控端當下按住的修飾鍵（避免黏鍵 / 漏修飾）。
+                Control::Enter { x, y, mods } => {
+                    emu.emit(&Event::MotionAbs { x, y })?;
+                    for (bit, usage) in MODIFIER_USAGES {
+                        if mods.0 & bit != 0 {
+                            emu.emit(&Event::Key { usage, dir: Direction::Press })?;
+                        }
+                    }
+                }
+                // 離開：放開所有按住的鍵，控制權交還主控端。
+                Control::Leave => {
+                    emu.release_all()?;
+                    tracing::info!("leave — 控制交還主控端");
+                }
             },
+            // 主控斷線：release 殘留按鍵，等下一個主控連入。
+            Incoming::Disconnected => {
+                emu.release_all()?;
+                tracing::info!("主控斷線 — 已放開所有按鍵");
+            }
         }
     }
     Ok(())
@@ -83,13 +113,14 @@ async fn run_connect(config: Option<PathBuf>, server: Option<SocketAddr>) -> Res
             .with_context(|| format!("config.server 不是合法位址：{}", cfg.server))?,
     };
 
+    let secret = load_secret()?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut cap = default_capture();
     cap.start(tx)?;
 
     // 斷線自動重連：WiFi 抖動 / 睡眠喚醒 / serve 重啟都會讓 QUIC 判死，不該要求手動重起。
     loop {
-        let link = match connect(addr).await {
+        let link = match connect(addr, secret.clone()).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!(error = %e, "連不上被控端，2 秒後重試…");
@@ -134,15 +165,15 @@ async fn drive(
                         if let Event::Key { usage, dir } = ev {
                             update_mods(&mut mods, usage, dir); // Local：鍵盤不轉發（吞掉）
                         }
-                        if let Event::MotionAbs { x, y } = ev {
-                            if let Some((ex, ey)) = enter_point(cfg.remote.side, x, y) {
-                                vx = ex * cfg.remote.width;
-                                vy = ey * cfg.remote.height;
-                                link.send_reliable(&Reliable::Control(Control::Enter { x: ex, y: ey, mods })).await?;
-                                cap.set_grab(true);
-                                target = Target::Remote;
-                                tracing::info!(ex, ey, "→ 進入對端");
-                            }
+                        if let Event::MotionAbs { x, y } = ev
+                            && let Some((ex, ey)) = enter_point(cfg.remote.side, x, y)
+                        {
+                            vx = ex * cfg.remote.width;
+                            vy = ey * cfg.remote.height;
+                            link.send_reliable(&Reliable::Control(Control::Enter { x: ex, y: ey, mods })).await?;
+                            cap.set_grab(true);
+                            target = Target::Remote;
+                            tracing::info!(ex, ey, "→ 進入對端");
                         }
                     }
                     // 控制對端：累積相對位移算虛擬游標，撞回反向邊緣則交還本機。
@@ -208,6 +239,14 @@ fn left_remote(side: Side, vx: f64, vy: f64, w: f64, h: f64) -> bool {
         Side::Top => vy > h,
     }
 }
+
+/// `Modifiers` bit ↔ 代表性的 HID usage（左鍵），serve 端進入時據此同步修飾鍵。
+const MODIFIER_USAGES: [(u16, u16); 4] = [
+    (Modifiers::CTRL, 0xE0),
+    (Modifiers::SHIFT, 0xE1),
+    (Modifiers::ALT, 0xE2),
+    (Modifiers::META, 0xE3),
+];
 
 /// 維護修飾鍵 bitflags（給 Enter 帶過去，讓對端對齊避免黏鍵）。
 fn update_mods(mods: &mut Modifiers, usage: u16, dir: Direction) {

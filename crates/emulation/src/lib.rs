@@ -6,6 +6,8 @@ use quickvm_event::{Direction, Event, MouseButton};
 /// 注入後端：把事件重放到本機。
 pub trait InputEmulator: Send {
     fn emit(&mut self, ev: &Event) -> anyhow::Result<()>;
+    /// 放開所有目前按住的鍵 —— 主控端交還（Leave）/ 斷線時呼叫，避免對端黏鍵。
+    fn release_all(&mut self) -> anyhow::Result<()>;
 }
 
 /// enigo 後端（跨平台合成；控不了 elevated 視窗 / 密碼欄 —— 見 v2 virtual-HID）。
@@ -13,6 +15,8 @@ pub struct EnigoEmulator {
     enigo: enigo::Enigo,
     /// 主螢幕像素尺寸，用來把正規化座標還原成像素。
     screen: (i32, i32),
+    /// 目前按住的鍵（HID usage），供 `release_all` 清乾淨防黏鍵。
+    pressed: std::collections::HashSet<u16>,
 }
 
 impl EnigoEmulator {
@@ -20,7 +24,11 @@ impl EnigoEmulator {
         use enigo::Mouse;
         let enigo = enigo::Enigo::new(&enigo::Settings::default())?;
         let screen = enigo.main_display().unwrap_or((1920, 1080));
-        Ok(Self { enigo, screen })
+        Ok(Self {
+            enigo,
+            screen,
+            pressed: std::collections::HashSet::new(),
+        })
     }
 }
 
@@ -49,9 +57,29 @@ impl InputEmulator for EnigoEmulator {
                 }
             }
             Event::Key { usage, dir } => match hid_to_enigo_key(*usage) {
-                Some(key) => self.enigo.key(key, map_dir(*dir))?,
+                Some(key) => {
+                    self.enigo.key(key, map_dir(*dir))?;
+                    match dir {
+                        Direction::Press => {
+                            self.pressed.insert(*usage);
+                        }
+                        Direction::Release => {
+                            self.pressed.remove(usage);
+                        }
+                    }
+                }
                 None => tracing::warn!(usage, "未映射的 HID usage，略過"),
             },
+        }
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> anyhow::Result<()> {
+        use enigo::Keyboard;
+        for usage in std::mem::take(&mut self.pressed) {
+            if let Some(key) = hid_to_enigo_key(usage) {
+                let _ = self.enigo.key(key, enigo::Direction::Release);
+            }
         }
         Ok(())
     }

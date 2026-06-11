@@ -8,6 +8,7 @@
 //! 限制：Secure Input（密碼欄）下 event tap 收不到鍵盤事件，macOS 設計使然。
 
 use crate::InputCapture;
+use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::display::CGDisplay;
 use core_graphics::event::CGEvent;
@@ -35,10 +36,12 @@ unsafe extern "C" {
         source: *const std::ffi::c_void,
         seconds: f64,
     );
+    /// re-enable 被 kernel 停用的 event tap（傳 tap 的 CFMachPortRef）。
+    fn CGEventTapEnable(tap: *const std::ffi::c_void, enable: bool);
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use tokio::sync::mpsc;
 
@@ -54,6 +57,12 @@ impl MacCapture {
             grab: Arc::new(AtomicBool::new(false)),
             screen: screen_size(),
         }
+    }
+}
+
+impl Default for MacCapture {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -91,8 +100,8 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>, screen: (f64
         unsafe { CGEventSourceSetLocalEventsSuppressionInterval(src.as_ptr() as *const _, 0.05) };
         std::mem::forget(src);
     }
-    let (w, h) = screen_size();
-    let (cx, cy) = (screen.0 / 2.0, screen.1 / 2.0);
+    let (w, h) = screen; // 已是主螢幕尺寸（MacCapture::new 取得），不必再 screen_size()
+    let (cx, cy) = (w / 2.0, h / 2.0);
     let events = vec![
         CGEventType::MouseMoved,
         CGEventType::LeftMouseDragged,
@@ -110,6 +119,11 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>, screen: (f64
         CGEventType::FlagsChanged, // 修飾鍵（Shift/Ctrl/Alt/Cmd）走這個，不發 KeyDown/KeyUp
     ];
 
+    // tap 被 kernel 停用後要從 callback 內 re-enable，需要 tap 的 mach port；
+    // tap 在 callback 之後才建好，故用 OnceLock 等建好再填。
+    let tap_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
+    let tap_port_cb = tap_port.clone();
+
     let tap = match CGEventTap::new(
         // Session 層（非 HID）：lan-mouse / Deskflow 都用這層 —— warp / suppression / Drop
         // 在 session 層的行為才正確；HID 最底層的 Drop 擋不住游標、suppression 也不吃。
@@ -118,6 +132,24 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>, screen: (f64
         CGEventTapOptions::Default,
         events,
         move |_proxy, etype, event| {
+            // tap 被 kernel 停用（callback 太慢逾時 / secure input / 權限變更）—— 必須處理，
+            // 否則 capture 整個停擺。timeout 可直接 re-enable；UserInput 是刻意停（密碼欄 /
+            // TCC 撤銷），釋放 grab + 顯示游標避免本機卡在被吞狀態。
+            match etype {
+                CGEventType::TapDisabledByTimeout => {
+                    if let Some(&p) = tap_port_cb.get() {
+                        unsafe { CGEventTapEnable(p as *const std::ffi::c_void, true) };
+                    }
+                    return CallbackResult::Keep;
+                }
+                CGEventType::TapDisabledByUserInput => {
+                    grab.store(false, Ordering::SeqCst);
+                    unsafe { CGDisplayShowCursor(CGMainDisplayID()) };
+                    tracing::warn!("event tap 被停用（secure input / 權限變更）—— 已釋放 grab");
+                    return CallbackResult::Keep;
+                }
+                _ => {}
+            }
             let g = grab.load(Ordering::SeqCst);
             let is_move = matches!(
                 etype,
@@ -162,6 +194,8 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>, screen: (f64
             return;
         }
     };
+    // tap 建好，把 mach port 存進 OnceLock 供 callback re-enable 用。
+    let _ = tap_port.set(tap.mach_port().as_concrete_TypeRef() as usize);
 
     let source = match tap.mach_port().create_runloop_source(0) {
         Ok(s) => s,

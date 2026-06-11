@@ -30,9 +30,6 @@ impl Modifiers {
     pub const ALT: u16 = 1 << 2; // mac: Option
     pub const META: u16 = 1 << 3; // mac: Command / win: Win
 
-    pub fn contains(self, flag: u16) -> bool {
-        self.0 & flag != 0
-    }
 }
 
 /// 一個輸入事件。
@@ -62,6 +59,4 @@ pub enum Control {
     Enter { x: f64, y: f64, mods: Modifiers },
     /// 游標離開對端，控制權交還主控端。
     Leave,
-    Ping,
-    Pong,
 }
