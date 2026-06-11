@@ -1,6 +1,6 @@
 //! QUIC 傳輸：鍵盤 / 控制走 reliable uni stream、指標走 unreliable datagram。
+//! 信任模型：PSK 認證（HMAC challenge-response）+ SSH-like 憑證指紋 pinning（TOFU）。
 //!
-//! TODO(security): client 目前 skip-verify，改 SSH-like fingerprint 信任（首次比對 + 存檔）。
 //! TODO(perf): CC 換 BBR / 調大 initial cwnd —— loss-based CC 在 WiFi 丟包會收縮、反增延遲。
 
 use anyhow::{Context, Result};
@@ -213,10 +213,68 @@ fn install_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-fn server_config() -> Result<ServerConfig> {
+/// 狀態目錄：`~/.config/quickvm/`（與 app 設定檔同層、兩平台同路徑慣例）。
+fn state_dir() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("無法定位 home 目錄")?
+        .join(".config/quickvm"))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// serve 憑證持久化：首跑生成存檔，之後重用 —— fingerprint pinning 的前提
+/// （每次重啟換憑證的話，client 的 TOFU 記錄永遠對不上）。
+/// 讀檔失敗（損壞 / 被刪）→ 重新生成覆寫；client 端會拒連，由操作者確認後
+/// 清 known_hosts 對應行重新信任 —— 這是 pinning 的語意，不靜默繞過。
+fn load_or_create_cert() -> Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> {
+    let dir = state_dir()?;
+    let cert_path = dir.join("cert.der");
+    let key_path = dir.join("key.der");
+    if let (Ok(c), Ok(k)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+        let cert = CertificateDer::from(c);
+        tracing::info!(fingerprint = %sha256_hex(cert.as_ref()), "serve 憑證（既有）");
+        return Ok((cert, PrivatePkcs8KeyDer::from(k)));
+    }
     let cert = rcgen::generate_simple_self_signed(vec!["quickvm".to_string()])?;
     let cert_der = cert.cert.der().clone();
     let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&cert_path, cert_der.as_ref())?;
+    write_private(&key_path, key_der.secret_pkcs8_der())?;
+    tracing::info!(fingerprint = %sha256_hex(cert_der.as_ref()), "serve 憑證（首跑生成，已存檔）");
+    Ok((cert_der, key_der))
+}
+
+/// 私鑰落地：unix 限 0600（Windows 靠 user profile 的 ACL，無簡單 per-file 對應）。
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(data)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)?;
+        Ok(())
+    }
+}
+
+fn server_config() -> Result<ServerConfig> {
+    let (cert_der, key_der) = load_or_create_cert()?;
     let mut sc = ServerConfig::with_single_cert(vec![cert_der], key_der.into())?;
     // 明設 idle timeout，跟 client keep-alive(5s) 對齊，不靠 quinn 預設。
     let mut tc = quinn::TransportConfig::default();
@@ -225,10 +283,14 @@ fn server_config() -> Result<ServerConfig> {
     Ok(sc)
 }
 
-fn client_config() -> Result<ClientConfig> {
+fn client_config(addr: &SocketAddr) -> Result<ClientConfig> {
+    let verifier = PinVerify {
+        addr: addr.to_string(),
+        path: state_dir()?.join("known_hosts"),
+    };
     let tls = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipVerify))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     let qcc = QuicClientConfig::try_from(Arc::new(tls))?;
     let mut cc = ClientConfig::new(Arc::new(qcc));
@@ -333,7 +395,7 @@ pub async fn connect(
 ) -> Result<(Link, mpsc::Receiver<Incoming>)> {
     install_crypto();
     let mut ep = Endpoint::client("0.0.0.0:0".parse()?)?;
-    ep.set_default_client_config(client_config()?);
+    ep.set_default_client_config(client_config(&addr)?);
     let conn = ep.connect(addr, "quickvm")?.await?;
     client_handshake(&conn, &secret).await?;
     // 收被控端的回送（剪貼簿回推）。連線死亡 accept_uni 出錯 → task 結束、channel 關閉。
@@ -461,35 +523,93 @@ impl Link {
     }
 }
 
+/// SSH-like fingerprint pinning（TOFU）：以 server 憑證 DER 的 SHA-256 為身分，
+/// 對 `~/.config/quickvm/known_hosts`（行格式 `<addr> sha256:<hex>`）比對 ——
+/// 首連記錄並信任、相符放行、**不符拒連**（MITM 或 serve 憑證重生）。
+/// 簽名驗證走 rustls 真驗證：憑證 DER 是公開資料，不驗 handshake 簽名的話
+/// 任何人都能重放被 pin 的憑證冒充（pin 形同虛設）。
 #[derive(Debug)]
-struct SkipVerify;
+struct PinVerify {
+    /// known_hosts 的 key —— 連線目標 addr（SNI 寫死 "quickvm" 無鑑別度）。
+    addr: String,
+    path: PathBuf,
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipVerify {
+/// 在 known_hosts 內容中查 addr 的既有指紋（純函數，可測）。
+fn known_hosts_lookup(content: &str, addr: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let mut it = line.split_whitespace();
+        (it.next() == Some(addr))
+            .then(|| it.next())
+            .flatten()
+            .and_then(|fp| fp.strip_prefix("sha256:"))
+            .map(str::to_string)
+    })
+}
+
+fn known_hosts_line(addr: &str, fp: &str) -> String {
+    format!("{addr} sha256:{fp}\n")
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinVerify {
     fn verify_server_cert(
         &self,
-        _: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _: &[CertificateDer<'_>],
         _: &rustls::pki_types::ServerName<'_>,
         _: &[u8],
         _: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        let fp = sha256_hex(end_entity.as_ref());
+        let content = std::fs::read_to_string(&self.path).unwrap_or_default();
+        match known_hosts_lookup(&content, &self.addr) {
+            Some(known) if known == fp => {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            Some(known) => Err(rustls::Error::General(format!(
+                "server 憑證指紋不符 —— known_hosts 記錄 {known}，對方出示 {fp}。\
+                 可能是 MITM，或 serve 的憑證重生過（重裝 / cert.der 被刪）；\
+                 確認是後者再刪除 {} 中 `{}` 那行重新信任",
+                self.path.display(),
+                self.addr,
+            ))),
+            None => {
+                // TOFU：首次連線信任並記錄。
+                if let Some(dir) = self.path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                std::fs::write(&self.path, content + &known_hosts_line(&self.addr, &fp))
+                    .map_err(|e| rustls::Error::General(format!("寫 known_hosts 失敗：{e}")))?;
+                tracing::info!(addr = %self.addr, fingerprint = %fp, "首次連線 —— 已信任並記錄指紋（TOFU）");
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+        }
     }
     fn verify_tls12_signature(
         &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
     }
     fn verify_tls13_signature(
         &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::aws_lc_rs::default_provider()
@@ -502,6 +622,43 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
 mod tests {
     use super::*;
     use std::fs;
+
+    // ---- known_hosts（TOFU pinning）----
+
+    #[test]
+    fn known_hosts_lookup_finds_entry() {
+        let content = "1.2.3.4:7777 sha256:aabb\n5.6.7.8:7777 sha256:ccdd\n";
+        assert_eq!(
+            known_hosts_lookup(content, "5.6.7.8:7777"),
+            Some("ccdd".to_string())
+        );
+        assert_eq!(known_hosts_lookup(content, "9.9.9.9:7777"), None);
+    }
+
+    #[test]
+    fn known_hosts_lookup_same_host_different_port_is_distinct() {
+        // 同 host 換 port 視為不同身分 —— 寬鬆合併會讓搬 port 的冒充者繼承信任。
+        let content = "1.2.3.4:7777 sha256:aabb\n";
+        assert_eq!(known_hosts_lookup(content, "1.2.3.4:8888"), None);
+    }
+
+    #[test]
+    fn known_hosts_lookup_ignores_malformed_lines() {
+        let content = "garbage\n1.2.3.4:7777 md5:oops\n1.2.3.4:7777 sha256:good\n";
+        assert_eq!(
+            known_hosts_lookup(content, "1.2.3.4:7777"),
+            Some("good".to_string())
+        );
+    }
+
+    #[test]
+    fn known_hosts_append_roundtrip() {
+        let line = known_hosts_line("1.2.3.4:7777", "deadbeef");
+        assert_eq!(
+            known_hosts_lookup(&line, "1.2.3.4:7777"),
+            Some("deadbeef".to_string())
+        );
+    }
 
     // ---- sanitize_name ----
 

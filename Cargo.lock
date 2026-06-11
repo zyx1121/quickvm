@@ -1268,6 +1268,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "dirs",
  "hmac",
  "quickvm-event",
  "quickvm-proto",
