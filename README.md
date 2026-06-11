@@ -100,7 +100,7 @@ Rust workspace, layered after [lan-mouse](https://github.com/feschber/lan-mouse)
 
 - **`event`** — platform-agnostic input model; **USB HID usage** is the key-code anchor (not OS keycodes), so all platforms map symmetrically
 - **`proto`** — [postcard](https://crates.io/crates/postcard) wire format; reliable (key / button / scroll / control / clipboard) vs datagram (motion) split
-- **`transport`** — [quinn](https://crates.io/crates/quinn) QUIC; self-signed cert + skip-verify *(TODO: SSH-like fingerprint)*, keep-alive, stale-datagram drop
+- **`transport`** — [quinn](https://crates.io/crates/quinn) QUIC; persisted self-signed cert + SSH-like fingerprint pinning (TOFU), keep-alive, stale-datagram drop
 - **`capture`** — `InputCapture` trait; macOS `CGEventTap` backend with cursor grab, others stub
 - **`emulation`** — `InputEmulator` trait; [enigo](https://crates.io/crates/enigo) backend *(v2: virtual-HID for UAC prompts / password fields)*
 - **`app`** — CLI: `serve` (controlled) / `connect` (controller, runs the edge-switch state machine)
@@ -132,7 +132,10 @@ macOS doesn't send KeyDown/KeyUp for Shift / Control / Option / Command — it s
 <details>
 <summary><b>Authentication</b></summary>
 
-QUIC/TLS encrypts the link, but the client uses skip-verify (no cert pinning yet), so transport encryption alone wouldn't stop an unauthorized peer from connecting and injecting input — and `serve` binds all interfaces. So a **pre-shared key** (`QUICKVM_SECRET`, same on both ends) gates every connection via HMAC-SHA256 challenge-response: `serve` sends a fresh per-connection nonce, the client returns `HMAC(secret, nonce)`, `serve` verifies (constant-time) and only then accepts input. The secret never goes on the wire, and the per-connection nonce defeats replay. `quickvm` refuses to start without it. *(MITM via the skip-verify cert is still possible on a hostile path — fingerprint pinning is on the roadmap; on a trusted LAN the PSK is the meaningful gate.)*
+Two layers, each blocking a different attack:
+
+- **Pre-shared key** (`QUICKVM_SECRET`, same on both ends) gates every connection via HMAC-SHA256 challenge-response: `serve` sends a fresh per-connection nonce, the client returns `HMAC(secret, nonce)`, `serve` verifies (constant-time) and only then accepts input. The secret never goes on the wire, the per-connection nonce defeats replay, and `quickvm` refuses to start without it. This blocks *unauthorized control* — `serve` binds all interfaces, so without it anyone reaching the port owns your keyboard.
+- **SSH-like certificate pinning (TOFU)** replaces the old skip-verify: `serve` generates its self-signed cert once and persists it (`~/.config/quickvm/cert.der`); the client records the cert's SHA-256 on first connect (`~/.config/quickvm/known_hosts`) and refuses any mismatch after that, with real TLS signature verification behind the pin (a pinned cert is public data — without proof-of-possession anyone could replay it). This blocks *impersonation/MITM* — a fake server could otherwise harvest your keystrokes even though the PSK keeps it from controlling anything. If `serve` legitimately regenerates its cert, delete the matching `known_hosts` line to re-trust.
 
 </details>
 
@@ -164,7 +167,8 @@ Residual latency is dominated by the **controller's Wi-Fi link** (RTT base drift
 - [ ] Windows capture (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) for bidirectional control
 - [ ] Clipboard: images
 - [ ] Proportional screen mapping (portrait Mac vs landscape Windows aren't equal-ratio yet)
-- [ ] SSH-like cert fingerprint trust (replace skip-verify); CC tuning (BBR / larger initial cwnd)
+- [x] SSH-like cert fingerprint trust (TOFU pinning, replaces skip-verify)
+- [ ] CC tuning (BBR / larger initial cwnd)
 - [ ] `serve` as a persistent / boot-start service
 - [ ] v2: virtual-HID inject (Karabiner daemon / FakerInput) to drive UAC prompts & password fields
 
