@@ -12,48 +12,31 @@ use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::display::CGDisplay;
 use core_graphics::event::CGEvent;
 use core_graphics::event::{
-    CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-    CallbackResult, EventField,
+    CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CallbackResult, EventField,
 };
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use foreign_types::ForeignType;
 use quickvm_event::{Direction, Event, MouseButton};
 
 // CoreGraphics 游標控制 C API（core-graphics crate 未提供 binding）。
-// grab 期間解除「實體滑鼠↔游標」連動使系統游標 freeze（但 event tap 仍收到 delta），
-// 並隱藏游標；放開時 warp 回螢幕中央再恢復連動，避免一放開又撞到 enter 邊緣。
+// grab 期間每筆移動把游標 warp 回螢幕中心並隱藏；移動量讀硬體 double delta，warp 回響事件
+// 靠 location==center 過濾（見 run_tap）。設計對齊 lan-mouse / Deskflow。
 unsafe extern "C" {
-    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
+    /// macOS 預設 warp 後抑制本機滑鼠事件 ~250ms。grab 模式每筆移動都 warp → 永遠在抑制窗內
+    /// → 移動斷續超卡。要對「特定 event source」設低值（全域 deprecated 版對 tap 不生效，
+    /// 這是先前超卡的主因）。lan-mouse 實測 0.05s 合適。
+    fn CGEventSourceSetLocalEventsSuppressionInterval(
+        source: *const std::ffi::c_void,
+        seconds: f64,
+    );
 }
 
-/// 把純 CLI process 提升為 GUI app —— 否則上面的 disassociate / hide cursor 回傳成功卻
-/// 靜默無效（需要 window server 連接）。kProcessTransformToForegroundApplication = 1。
-#[repr(C)]
-struct ProcessSerialNumber {
-    high_long_of_psn: u32,
-    low_long_of_psn: u32,
-}
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn TransformProcessType(psn: *const ProcessSerialNumber, transform_state: u32) -> i32;
-}
-const K_CURRENT_PROCESS: u32 = 2;
-const K_FOREGROUND_APP: u32 = 1;
-
-/// 提升為 foreground GUI app，讓游標 freeze/hide 生效。冪等，啟動時呼叫一次。
-fn become_gui_app() {
-    unsafe {
-        let psn = ProcessSerialNumber {
-            high_long_of_psn: 0,
-            low_long_of_psn: K_CURRENT_PROCESS,
-        };
-        let r = TransformProcessType(&psn, K_FOREGROUND_APP);
-        tracing::info!(transform_ret = r, "TransformProcessType → foreground GUI app");
-    }
-}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -61,7 +44,7 @@ use tokio::sync::mpsc;
 
 pub struct MacCapture {
     grab: Arc<AtomicBool>,
-    /// 主螢幕像素尺寸，放開 grab 時 warp 游標回中央用。
+    /// 主螢幕像素尺寸。
     screen: (f64, f64),
 }
 
@@ -76,38 +59,40 @@ impl MacCapture {
 
 impl InputCapture for MacCapture {
     fn start(&mut self, tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
-        // 必須在 spawn capture thread 前（主執行緒）提升為 GUI app，游標控制才生效。
-        become_gui_app();
         let grab = self.grab.clone();
+        let screen = self.screen;
         // CGEventTap + CFRunLoop 必須在自己的 thread 跑（run loop 阻塞）。
         thread::Builder::new()
             .name("quickvm-capture".into())
-            .spawn(move || run_tap(tx, grab))?;
+            .spawn(move || run_tap(tx, grab, screen))?;
         Ok(())
     }
 
     fn set_grab(&mut self, grab: bool) {
         self.grab.store(grab, Ordering::SeqCst);
+        let c = CGPoint::new(self.screen.0 / 2.0, self.screen.1 / 2.0);
         unsafe {
+            // 進 / 出 grab 都先 warp 游標回中心：進 grab 是釘住的基準點；
+            // 出 grab 是避免游標停在 enter 邊緣反覆觸發。
+            CGWarpMouseCursorPosition(c);
             if grab {
-                // 解除連動 → 系統游標 freeze（delta 仍會進 event tap）+ 隱藏。
-                let a = CGAssociateMouseAndMouseCursorPosition(0);
-                let h = CGDisplayHideCursor(CGMainDisplayID());
-                tracing::info!(assoc_ret = a, hide_ret = h, "grab ON (0=success)");
+                CGDisplayHideCursor(CGMainDisplayID());
             } else {
-                // 先 warp 回中央（避免一放開又落在 enter 邊緣反覆觸發），再恢復連動 + 顯示。
-                let c = CGPoint::new(self.screen.0 / 2.0, self.screen.1 / 2.0);
-                let w = CGWarpMouseCursorPosition(c);
-                let a = CGAssociateMouseAndMouseCursorPosition(1);
-                let s = CGDisplayShowCursor(CGMainDisplayID());
-                tracing::info!(warp_ret = w, assoc_ret = a, show_ret = s, "grab OFF");
+                CGDisplayShowCursor(CGMainDisplayID());
             }
         }
     }
 }
 
-fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>) {
+fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>, screen: (f64, f64)) {
+    // 對 session event source 設低 suppression interval：否則每筆 warp 後 ~250ms 抑制窗 → 超卡。
+    // source 設完即可釋放（interval 記在 session state）；forget 跟 lan-mouse 一致避免 drop 重置。
+    if let Ok(src) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
+        unsafe { CGEventSourceSetLocalEventsSuppressionInterval(src.as_ptr() as *const _, 0.05) };
+        std::mem::forget(src);
+    }
     let (w, h) = screen_size();
+    let (cx, cy) = (screen.0 / 2.0, screen.1 / 2.0);
     let events = vec![
         CGEventType::MouseMoved,
         CGEventType::LeftMouseDragged,
@@ -122,31 +107,49 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>) {
         CGEventType::ScrollWheel,
         CGEventType::KeyDown,
         CGEventType::KeyUp,
+        CGEventType::FlagsChanged, // 修飾鍵（Shift/Ctrl/Alt/Cmd）走這個，不發 KeyDown/KeyUp
     ];
 
     let tap = match CGEventTap::new(
-        CGEventTapLocation::HID,
+        // Session 層（非 HID）：lan-mouse / Deskflow 都用這層 —— warp / suppression / Drop
+        // 在 session 層的行為才正確；HID 最底層的 Drop 擋不住游標、suppression 也不吃。
+        CGEventTapLocation::Session,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         events,
         move |_proxy, etype, event| {
             let g = grab.load(Ordering::SeqCst);
-            if let Some(ev) = translate(etype, event, w, h, g) {
+            let is_move = matches!(
+                etype,
+                CGEventType::MouseMoved
+                    | CGEventType::LeftMouseDragged
+                    | CGEventType::RightMouseDragged
+                    | CGEventType::OtherMouseDragged
+            );
+            if g && is_move {
+                // grab 模式滑鼠：硬體 double delta 轉發 + warp 回中心釘住游標。
+                // warp 回響事件 location 必在中心 → 過濾掉（否則其反向 delta 抵銷真實移動）；
+                // 真實移動發生時游標已被移離中心，不會誤殺。
+                let pos = event.location();
+                if (pos.x - cx).abs() < 0.5 && (pos.y - cy).abs() < 0.5 {
+                    event.set_type(CGEventType::Null);
+                    return CallbackResult::Drop;
+                }
+                let dx = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
+                let dy = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+                if dx != 0.0 || dy != 0.0 {
+                    let _ = tx.send(Event::MotionRel { dx, dy });
+                }
+                unsafe { CGWarpMouseCursorPosition(CGPoint::new(cx, cy)) };
+                event.set_type(CGEventType::Null); // Drop 後 CF 仍可能外傳，設 Null 確保本機收不到
+                return CallbackResult::Drop;
+            }
+            // 其他事件（非 grab 的移動、或鍵盤 / 按鈕 / 捲動）走一般轉換。
+            if let Some(ev) = translate(etype, event, w, h) {
                 let _ = tx.send(ev);
             }
             if g {
-                // disassociate/hide 在 CLI process 不可靠 → 用 warp 強制把游標釘回中心。
-                // delta 已由 translate 從事件讀出（不受 warp 影響）；warp 到「已在的位置」
-                // 不再產生事件，故不會無限迴圈。
-                if matches!(
-                    etype,
-                    CGEventType::MouseMoved
-                        | CGEventType::LeftMouseDragged
-                        | CGEventType::RightMouseDragged
-                        | CGEventType::OtherMouseDragged
-                ) {
-                    unsafe { CGWarpMouseCursorPosition(CGPoint::new(w / 2.0, h / 2.0)) };
-                }
+                event.set_type(CGEventType::Null);
                 CallbackResult::Drop
             } else {
                 CallbackResult::Keep
@@ -176,22 +179,16 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>) {
     CFRunLoop::run_current();
 }
 
-fn translate(etype: CGEventType, event: &CGEvent, w: f64, h: f64, grab: bool) -> Option<Event> {
+fn translate(etype: CGEventType, event: &CGEvent, w: f64, h: f64) -> Option<Event> {
     use CGEventType::*;
     match etype {
         MouseMoved | LeftMouseDragged | RightMouseDragged | OtherMouseDragged => {
-            if grab {
-                // grab 期間游標 freeze，絕對位置不再變 → 改送相對位移。
-                let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f64;
-                let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64;
-                Some(Event::MotionRel { dx, dy })
-            } else {
-                let p = event.location();
-                Some(Event::MotionAbs {
-                    x: (p.x / w).clamp(0.0, 1.0),
-                    y: (p.y / h).clamp(0.0, 1.0),
-                })
-            }
+            // 非 grab 的移動才走這裡（grab 移動在 callback 用位置差分處理）。
+            let p = event.location();
+            Some(Event::MotionAbs {
+                x: (p.x / w).clamp(0.0, 1.0),
+                y: (p.y / h).clamp(0.0, 1.0),
+            })
         }
         LeftMouseDown => Some(btn(MouseButton::Left, Direction::Press)),
         LeftMouseUp => Some(btn(MouseButton::Left, Direction::Release)),
@@ -209,6 +206,19 @@ fn translate(etype: CGEventType, event: &CGEvent, w: f64, h: f64, grab: bool) ->
         }
         KeyDown => key_event(event, Direction::Press),
         KeyUp => key_event(event, Direction::Release),
+        // 修飾鍵：macOS 不發 KeyDown/KeyUp，發 FlagsChanged。keycode 指出哪個鍵，
+        // 方向看該鍵對應的 flag bit 在事件當下是否仍 set（set=按下、clear=放開）。
+        FlagsChanged => {
+            let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+            let usage = cgkeycode_to_hid(keycode)?;
+            let mask = modifier_flag_mask(keycode)?;
+            let dir = if event.get_flags().contains(mask) {
+                Direction::Press
+            } else {
+                Direction::Release
+            };
+            Some(Event::Key { usage, dir })
+        }
         _ => None,
     }
 }
@@ -218,6 +228,19 @@ fn key_event(event: &CGEvent, dir: Direction) -> Option<Event> {
     Some(Event::Key {
         usage: cgkeycode_to_hid(keycode)?,
         dir,
+    })
+}
+
+/// 修飾鍵 virtual keycode → 對應的 `CGEventFlags` bit（用來從 FlagsChanged 判按下/放開）。
+/// 左右同鍵共用一個 flag（macOS flags 不分左右）—— 同時按左右同修飾鍵的 edge case 暫不處理。
+fn modifier_flag_mask(keycode: u16) -> Option<CGEventFlags> {
+    Some(match keycode {
+        0x38 | 0x3C => CGEventFlags::CGEventFlagShift,     // L/R Shift
+        0x3B | 0x3E => CGEventFlags::CGEventFlagControl,   // L/R Control
+        0x3A | 0x3D => CGEventFlags::CGEventFlagAlternate, // L/R Alt/Option
+        0x37 | 0x36 => CGEventFlags::CGEventFlagCommand,   // L/R Cmd
+        0x39 => CGEventFlags::CGEventFlagAlphaShift,       // CapsLock
+        _ => return None,
     })
 }
 
