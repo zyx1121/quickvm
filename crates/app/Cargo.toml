@@ -19,3 +19,7 @@ tracing-subscriber = "0.3.23"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 dirs = "5.0"
+
+# GUI subsystem 下接回父 console 用（見 main.rs attach_parent_console）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
