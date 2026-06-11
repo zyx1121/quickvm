@@ -71,6 +71,12 @@ side = "right"   # which side the remote sits on: left / right / top / bottom
 
 ## Run
 
+Both ends need the **same shared secret** in `QUICKVM_SECRET` — without it `quickvm` refuses to start (no auth would mean anyone who can reach the port owns your keyboard & mouse, see [Design notes](#design-notes)). Generate one once and use it on both machines:
+
+```sh
+export QUICKVM_SECRET="$(openssl rand -hex 32)"
+```
+
 On the **controlled** machine (Windows), inject-only:
 
 ```sh
@@ -120,6 +126,13 @@ While you're driving the remote, the controller must keep its own cursor frozen 
 macOS doesn't send KeyDown/KeyUp for Shift / Control / Option / Command — it sends **`FlagsChanged`**. quickvm listens for it, reads the keycode to know which modifier, and checks the corresponding flag bit to tell press from release.
 
 **CapsLock is a hardware toggle**: the event tap sees the event but can't stop the local LED/state from flipping (lan-mouse and Deskflow have the same limitation). While grabbed, use **Shift** to type uppercase rather than CapsLock.
+
+</details>
+
+<details>
+<summary><b>Authentication</b></summary>
+
+QUIC/TLS encrypts the link, but the client uses skip-verify (no cert pinning yet), so transport encryption alone wouldn't stop an unauthorized peer from connecting and injecting input — and `serve` binds all interfaces. So a **pre-shared key** (`QUICKVM_SECRET`, same on both ends) gates every connection via HMAC-SHA256 challenge-response: `serve` sends a fresh per-connection nonce, the client returns `HMAC(secret, nonce)`, `serve` verifies (constant-time) and only then accepts input. The secret never goes on the wire, and the per-connection nonce defeats replay. `quickvm` refuses to start without it. *(MITM via the skip-verify cert is still possible on a hostile path — fingerprint pinning is on the roadmap; on a trusted LAN the PSK is the meaningful gate.)*
 
 </details>
 
