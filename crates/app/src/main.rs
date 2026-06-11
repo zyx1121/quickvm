@@ -4,6 +4,11 @@
 //! 主控端跑邊緣切換狀態機：游標撞到「朝向對端那側」的螢幕邊緣才穿過去控制對端，
 //! 期間吞掉本機輸入（grab）；在對端撞回反向邊緣則交還本機。方位 / 尺寸由設定檔決定。
 
+// Windows 用 GUI subsystem：console app 在 interactive session（schtasks 起 serve）
+// 必開一個 console 視窗，誤關即殺 serve。GUI subsystem 無視窗背景跑；
+// 從 terminal 手動跑的輸出由下面 attach_parent_console() 接回。
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod clipboard;
 mod config;
 
@@ -45,10 +50,23 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_parent_console();
     tracing_subscriber::fmt::init();
     match Cli::parse().cmd {
         Cmd::Serve { bind } => run_serve(bind).await,
         Cmd::Connect { config, server } => run_connect(config, server).await,
+    }
+}
+
+/// GUI subsystem 沒有 console：從 terminal 跑時 attach 回父 console 讓輸出 / clap
+/// 錯誤訊息可見；由 task / 雙擊啟動（父無 console）attach 失敗 → 維持無視窗背景。
+/// 已被 redirect 的 std handle（task 的 `> log`）不受 attach 影響，照寫檔案。
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }
 
