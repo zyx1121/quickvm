@@ -37,9 +37,9 @@
 | platform | capture (controller) | inject (controlled) |
 |----------|----------------------|---------------------|
 | macOS    | ✅ CGEventTap — mouse, keyboard, modifiers, scroll | ✅ enigo |
-| Windows  | 🔲 TODO (`WH_*_LL` low-level hooks) | ✅ enigo (cross-platform) |
+| Windows  | ✅ `WH_KEYBOARD_LL` / `WH_MOUSE_LL` — mouse, keyboard, scroll, warp-to-center grab | ✅ enigo (cross-platform) |
 
-Today **Mac (controller) → Windows (controlled)** works end-to-end: edge switching, cursor grab, keyboard + modifiers, auto-reconnect. The controlled side only injects, so it needs no capture backend.
+Both directions work end-to-end now: either box can be the controller (run `connect`) driving the other (`serve`), with edge switching, cursor grab, keyboard + modifiers, and auto-reconnect. The Windows controller needs no special permission (LL hooks are unprivileged); on Windows the `connect` side, like `serve`, must run in the interactive console session (session 1) or the hooks won't see real input.
 
 ## Build
 
@@ -101,7 +101,7 @@ Rust workspace, layered after [lan-mouse](https://github.com/feschber/lan-mouse)
 - **`event`** — platform-agnostic input model; **USB HID usage** is the key-code anchor (not OS keycodes), so all platforms map symmetrically
 - **`proto`** — [postcard](https://crates.io/crates/postcard) wire format; reliable (key / button / scroll / control / clipboard) vs datagram (motion) split
 - **`transport`** — [quinn](https://crates.io/crates/quinn) QUIC; persisted self-signed cert + SSH-like fingerprint pinning (TOFU), keep-alive, stale-datagram drop
-- **`capture`** — `InputCapture` trait; macOS `CGEventTap` backend with cursor grab, others stub
+- **`capture`** — `InputCapture` trait; macOS `CGEventTap` + Windows `WH_*_LL` backends (both warp-to-center grab, injected-event loop guard), others stub
 - **`emulation`** — `InputEmulator` trait; [enigo](https://crates.io/crates/enigo) backend *(v2: virtual-HID for UAC prompts / password fields)*
 - **`app`** — CLI: `serve` (controlled) / `connect` (controller, runs the edge-switch state machine)
 
@@ -164,8 +164,9 @@ Residual latency is dominated by the **controller's Wi-Fi link** (RTT base drift
 - [x] Screen-edge enter/leave + input swallow (real KVM feel)
 - [x] Cursor grab/freeze, modifiers, auto-reconnect, fixed-tick motion coalescing
 - [x] Clipboard sync (text + files, both directions, synced on edge switch)
-- [ ] Windows capture (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) for bidirectional control
+- [x] Windows capture (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) — bidirectional control
 - [ ] Clipboard: images
+- [ ] CI guards build/clippy/test on macOS + Windows; edge-switch logic unit-tested
 - [ ] Proportional screen mapping (portrait Mac vs landscape Windows aren't equal-ratio yet)
 - [x] SSH-like cert fingerprint trust (TOFU pinning, replaces skip-verify)
 - [ ] CC tuning (BBR / larger initial cwnd)
