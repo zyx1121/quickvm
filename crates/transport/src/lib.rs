@@ -497,3 +497,98 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
             .supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // ---- sanitize_name ----
+
+    #[test]
+    fn sanitize_keeps_plain_name() {
+        assert_eq!(sanitize_name("report.txt"), "report.txt");
+    }
+
+    #[test]
+    fn sanitize_strips_path_components() {
+        // `/` 在所有平台都是分隔符，這兩個 case 平台無關。
+        assert_eq!(sanitize_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_name("a/b/c.txt"), "c.txt");
+    }
+
+    #[test]
+    fn sanitize_backslash_safe_on_both_platforms() {
+        // `\` 只有 Windows 當分隔符，Unix 是合法檔名字元 —— 期望值分平台，
+        // 但安全不變量一致：結果是單一 component，join 後逃不出目的目錄。
+        let got = sanitize_name("..\\windows\\evil.exe");
+        if cfg!(windows) {
+            assert_eq!(got, "evil.exe");
+        } else {
+            assert_eq!(got, "..\\windows\\evil.exe");
+        }
+        assert!(!got.contains('/'));
+        assert_ne!(got, "..");
+    }
+
+    #[test]
+    fn sanitize_degenerate_inputs_become_unnamed() {
+        assert_eq!(sanitize_name(""), "unnamed");
+        assert_eq!(sanitize_name(".."), "unnamed");
+    }
+
+    #[test]
+    fn sanitize_preserves_unicode() {
+        assert_eq!(sanitize_name("報告 🎉.txt"), "報告 🎉.txt");
+    }
+
+    // ---- unique_path ----
+
+    /// 測試平行跑，共用目錄會互污衝突計數 —— 每測一個獨立子目錄，Drop 清理
+    /// 確保 assert 失敗也不在 temp_dir 留垃圾。
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join("quickvm-transport-tests")
+                .join(format!("{}-{tag}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unique_path_returns_original_when_free() {
+        let d = TestDir::new("free");
+        assert_eq!(unique_path(&d.0, "a.txt".into()), d.0.join("a.txt"));
+    }
+
+    #[test]
+    fn unique_path_suffixes_on_conflict() {
+        let d = TestDir::new("conflict");
+        fs::write(d.0.join("a.txt"), b"x").unwrap();
+        assert_eq!(unique_path(&d.0, "a.txt".into()), d.0.join("a (1).txt"));
+    }
+
+    #[test]
+    fn unique_path_increments_until_free() {
+        let d = TestDir::new("increment");
+        fs::write(d.0.join("a.txt"), b"x").unwrap();
+        fs::write(d.0.join("a (1).txt"), b"x").unwrap();
+        assert_eq!(unique_path(&d.0, "a.txt".into()), d.0.join("a (2).txt"));
+    }
+
+    #[test]
+    fn unique_path_conflict_without_extension() {
+        let d = TestDir::new("noext");
+        fs::write(d.0.join("data"), b"x").unwrap();
+        assert_eq!(unique_path(&d.0, "data".into()), d.0.join("data (1)"));
+    }
+}
