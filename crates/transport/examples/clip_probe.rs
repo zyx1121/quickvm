@@ -98,12 +98,59 @@ async fn main() -> Result<()> {
         Ok(other) => bail!("不該回送卻收到 {other:?}"),
     }
 
-    if remote_wait.is_none() {
-        run_file_tests(&link, &mut back_rx, nonce).await?;
+    match remote_wait {
+        None => run_file_tests(&link, &mut back_rx, nonce).await?,
+        Some(wait) => run_remote_file_tests(&link, &mut back_rx, nonce, wait).await?,
     }
 
     println!("ALL PASS");
     Ok(())
+}
+
+/// 跨機檔案流程：推檔（印 hash 供外部對對端 `Get-FileHash` 驗）→ 等外部把對端
+/// 剪貼簿設成新檔案 → Leave 收回送、印內容 hash（外部比對）。
+async fn run_remote_file_tests(
+    link: &quickvm_transport::Link,
+    back_rx: &mut tokio::sync::mpsc::Receiver<quickvm_transport::Incoming>,
+    nonce: u32,
+    wait: u64,
+) -> Result<()> {
+    use quickvm_transport::Incoming;
+    use sha2::{Digest, Sha256};
+
+    let src_dir = std::env::temp_dir().join(format!("quickvm-probe-{nonce}"));
+    std::fs::create_dir_all(&src_dir)?;
+    let payload: Vec<u8> = (0..500_000u32).flat_map(|i| i.to_le_bytes()).collect();
+    let f = src_dir.join(format!("cross-{nonce}.bin"));
+    std::fs::write(&f, &payload)?;
+    let hash = hex(&Sha256::digest(&payload));
+    link.files_link().send_files(&[f]).await?;
+    println!("FILE-PUSHED cross-{nonce}.bin sha256={hash}");
+
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+
+    link.send_reliable(&Reliable::Control(Control::Leave))
+        .await?;
+    match tokio::time::timeout(Duration::from_secs(10), back_rx.recv()).await {
+        Ok(Some(Incoming::Files(paths))) => {
+            for p in &paths {
+                let got = std::fs::read(p)?;
+                println!(
+                    "FILE-REPLY {} sha256={} ({} bytes)",
+                    p.display(),
+                    hex(&Sha256::digest(&got)),
+                    got.len()
+                );
+            }
+        }
+        other => bail!("預期回送檔案，得到 {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&src_dir);
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// 檔案剪貼簿鏈路（本機模式）：推送落地 + 內容一致、回送方向、檔名 sanitize。
