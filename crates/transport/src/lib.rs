@@ -3,21 +3,28 @@
 //! TODO(security): client 目前 skip-verify，改 SSH-like fingerprint 信任（首次比對 + 存檔）。
 //! TODO(perf): CC 換 BBR / 調大 initial cwnd —— loss-based CC 在 WiFi 丟包會收縮、反增延遲。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use quickvm_proto::{
-    Motion, Reliable, decode_motion, decode_reliable, encode_motion, encode_reliable,
+    FILES_MAX_TOTAL, FileMeta, FilesHeader, Motion, Reliable, STREAM_TAG_FILES, STREAM_TAG_MSG,
+    decode_files_header, decode_motion, decode_reliable, encode_files_header, encode_motion,
+    encode_reliable,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::Sha256;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 // reliable frame 上限：要容得下剪貼簿訊息（CLIPBOARD_MAX + postcard enum/長度 overhead）。
 const MAX_FRAME: usize = quickvm_proto::CLIPBOARD_MAX + 64;
+// 檔案串流的讀寫 chunk。
+const FILE_CHUNK: usize = 64 * 1024;
 
 /// 從對端收到的一則訊息。
 #[derive(Debug)]
@@ -25,13 +32,16 @@ pub enum Incoming {
     /// 主控端認證通過 —— 帶回送句柄（被控端 Leave 時回推剪貼簿用）。
     Connected(BackLink),
     Reliable(Reliable),
+    /// 剪貼簿檔案：內容已 streaming 落地到本機暫存，這裡是落地後的路徑。
+    Files(Vec<PathBuf>),
     Motion(Motion),
     /// 連線結束 —— 被控端據此 release 所有按住的鍵，避免主控斷線後黏鍵。
     Disconnected,
 }
 
 /// 被控端 → 主控端的回送句柄（uni stream，與主控端送來的方向相反）。
-#[derive(Debug)]
+/// 可 clone：檔案回送 spawn 背景 task 用。
+#[derive(Debug, Clone)]
 pub struct BackLink {
     conn: Connection,
 }
@@ -40,13 +50,162 @@ impl BackLink {
     pub async fn send_reliable(&self, msg: &Reliable) -> Result<()> {
         send_reliable_on(&self.conn, msg).await
     }
+
+    pub async fn send_files(&self, paths: &[PathBuf]) -> Result<()> {
+        send_files_on(&self.conn, paths).await
+    }
 }
 
 async fn send_reliable_on(conn: &Connection, msg: &Reliable) -> Result<()> {
     let mut s = conn.open_uni().await?;
+    s.write_all(&[STREAM_TAG_MSG]).await?;
     s.write_all(&encode_reliable(msg)).await?;
     s.finish()?;
     Ok(())
+}
+
+/// 檔案傳輸：tag + header(u32 LE 長度 + postcard) + 各檔 raw bytes 串接。
+/// 邊讀邊送（不全載記憶體）；`take`-style 截斷保證檔案在傳輸中被改大時協定不錯位。
+async fn send_files_on(conn: &Connection, paths: &[PathBuf]) -> Result<()> {
+    let mut metas = Vec::with_capacity(paths.len());
+    for p in paths {
+        let md = tokio::fs::metadata(p)
+            .await
+            .with_context(|| format!("讀檔案 metadata 失敗：{}", p.display()))?;
+        anyhow::ensure!(
+            md.is_file(),
+            "不是一般檔案（資料夾不支援）：{}",
+            p.display()
+        );
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("檔名非 UTF-8")?
+            .to_string();
+        metas.push(FileMeta {
+            name,
+            size: md.len(),
+        });
+    }
+    let total: u64 = metas.iter().map(|m| m.size).sum();
+    anyhow::ensure!(
+        total <= FILES_MAX_TOTAL,
+        "檔案總量 {total} 超過上限 {FILES_MAX_TOTAL}"
+    );
+
+    let mut s = conn.open_uni().await?;
+    s.write_all(&[STREAM_TAG_FILES]).await?;
+    let hdr = encode_files_header(&FilesHeader {
+        files: metas.clone(),
+    });
+    s.write_all(&(hdr.len() as u32).to_le_bytes()).await?;
+    s.write_all(&hdr).await?;
+
+    let mut buf = vec![0u8; FILE_CHUNK];
+    for (p, m) in paths.iter().zip(&metas) {
+        let mut f = tokio::fs::File::open(p).await?;
+        let mut remaining = m.size;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = f.read(&mut buf[..want]).await?;
+            anyhow::ensure!(n > 0, "檔案在傳輸中縮小：{}", p.display());
+            s.write_all(&buf[..n]).await?;
+            remaining -= n as u64;
+        }
+    }
+    s.finish()?;
+    Ok(())
+}
+
+/// 接收檔案串流，落地到暫存目錄（每批一個子目錄，避免互相覆蓋），回傳落地路徑。
+async fn recv_files(recv: &mut quinn::RecvStream) -> Result<Vec<PathBuf>> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+    let hlen = u32::from_le_bytes(len_buf) as usize;
+    anyhow::ensure!(hlen <= MAX_FRAME, "files header 過大：{hlen}");
+    let mut hbuf = vec![0u8; hlen];
+    recv.read_exact(&mut hbuf).await?;
+    let header = decode_files_header(&hbuf)?;
+    let total: u64 = header.files.iter().map(|f| f.size).sum();
+    anyhow::ensure!(total <= FILES_MAX_TOTAL, "檔案總量超過上限：{total}");
+
+    let dir = new_recv_dir().await?;
+    let mut out = Vec::with_capacity(header.files.len());
+    let mut buf = vec![0u8; FILE_CHUNK];
+    for meta in &header.files {
+        let path = unique_path(&dir, sanitize_name(&meta.name));
+        let mut f = tokio::fs::File::create(&path).await?;
+        let mut remaining = meta.size;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = recv
+                .read(&mut buf[..want])
+                .await?
+                .context("檔案串流提前結束")?;
+            f.write_all(&buf[..n]).await?;
+            remaining -= n as u64;
+        }
+        f.flush().await?;
+        out.push(path);
+    }
+    Ok(out)
+}
+
+/// 暫存根目錄：`<tmp>/quickvm-files/<毫秒序號>/`。新批次開新子目錄；
+/// 上限之前的舊批次保留（對端 clipboard 可能還指著），由啟動清理收走。
+async fn new_recv_dir() -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join("quickvm-files").join(format!(
+        "{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+    ));
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
+/// 啟動時清掉整個暫存根目錄 —— process 重啟後沒有任何 clipboard 引用仍然有效。
+pub fn clean_recv_root() {
+    let root = std::env::temp_dir().join("quickvm-files");
+    if root.exists() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// 只取檔名本體，擋 path traversal（`..`、分隔符都進不來）。
+fn sanitize_name(name: &str) -> String {
+    let base = Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed");
+    if base.is_empty() || base == ".." {
+        "unnamed".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// 同批重名時加 ` (n)` 後綴，不覆蓋。
+fn unique_path(dir: &Path, name: String) -> PathBuf {
+    let candidate = dir.join(&name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = Path::new(&name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unnamed");
+    let ext = Path::new(&name).extension().and_then(|e| e.to_str());
+    for i in 1.. {
+        let alt = match ext {
+            Some(e) => dir.join(format!("{stem} ({i}).{e}")),
+            None => dir.join(format!("{stem} ({i})")),
+        };
+        if !alt.exists() {
+            return alt;
+        }
+    }
+    unreachable!()
 }
 
 /// rustls 0.23 需要 process-level crypto provider（冪等）。
@@ -129,26 +288,49 @@ fn spawn_recv(conn: Connection, tx: mpsc::Sender<Incoming>) {
             }
         }
     });
-    // uni stream（鍵盤 / 按鈕 / 捲動 / 控制）—— 每則一條 stream。
+    // uni stream（小訊息 / 檔案串流，由 tag byte 分流）。
     // accept_uni 出錯 = 連線結束 → 通知被控端 release 按住的鍵。
     tokio::spawn(async move {
-        while let Ok(mut recv) = conn.accept_uni().await {
+        while let Ok(recv) = conn.accept_uni().await {
+            // 檔案串流可能跑很久，獨立 task 收 —— 不擋後面的鍵鼠訊息 stream。
+            let tx = tx.clone();
+            tokio::spawn(async move { handle_uni(recv, tx).await });
+        }
+        let _ = tx.send(Incoming::Disconnected).await;
+    });
+}
+
+/// 讀 tag byte 分流一條 uni stream：小訊息（postcard）或檔案串流。
+async fn handle_uni(mut recv: quinn::RecvStream, tx: mpsc::Sender<Incoming>) {
+    let mut tag = [0u8; 1];
+    if recv.read_exact(&mut tag).await.is_err() {
+        return;
+    }
+    match tag[0] {
+        STREAM_TAG_MSG => {
             if let Ok(buf) = recv.read_to_end(MAX_FRAME).await
                 && let Ok(r) = decode_reliable(&buf)
             {
                 let _ = tx.send(Incoming::Reliable(r)).await;
             }
         }
-        let _ = tx.send(Incoming::Disconnected).await;
-    });
+        STREAM_TAG_FILES => match recv_files(&mut recv).await {
+            Ok(paths) => {
+                let _ = tx.send(Incoming::Files(paths)).await;
+            }
+            Err(e) => tracing::warn!(error = %e, "接收剪貼簿檔案失敗"),
+        },
+        other => tracing::warn!(tag = other, "未知 stream tag，忽略"),
+    }
 }
 
 /// 主控端：連到被控端，通過 PSK 認證後回傳連線句柄 + 對端回送訊息的 channel
 /// （與 `Link` 分開回傳 —— 同一個 struct 在 select! 裡同時收又送會撞 borrow）。
+/// 回送 channel 收 `Incoming::Reliable` / `Incoming::Files`（其餘 variant 不會出現）。
 pub async fn connect(
     addr: SocketAddr,
     secret: Vec<u8>,
-) -> Result<(Link, mpsc::Receiver<Reliable>)> {
+) -> Result<(Link, mpsc::Receiver<Incoming>)> {
     install_crypto();
     let mut ep = Endpoint::client("0.0.0.0:0".parse()?)?;
     ep.set_default_client_config(client_config()?);
@@ -158,12 +340,9 @@ pub async fn connect(
     let (tx, rx) = mpsc::channel(16);
     let c = conn.clone();
     tokio::spawn(async move {
-        while let Ok(mut recv) = c.accept_uni().await {
-            if let Ok(buf) = recv.read_to_end(MAX_FRAME).await
-                && let Ok(r) = decode_reliable(&buf)
-            {
-                let _ = tx.send(r).await;
-            }
+        while let Ok(recv) = c.accept_uni().await {
+            let tx = tx.clone();
+            tokio::spawn(async move { handle_uni(recv, tx).await });
         }
     });
     Ok((
@@ -178,7 +357,7 @@ pub async fn connect(
 /// PSK challenge-response（HMAC-SHA256）。傳輸已 TLS 加密，但 skip-verify 不防 MITM，
 /// 故 secret 不直接上線：serve 出 nonce、client 回 HMAC(secret, nonce)，serve 驗。
 /// 擋掉「任何人連上就能注入鍵鼠」這個主威脅；MITM 重放被 per-連線新 nonce 擋掉。
-const HS_VERSION: u8 = 2; // v2: Reliable 加 Clipboard variant + 被控端回送 stream
+const HS_VERSION: u8 = 3; // v3: uni stream 加 tag byte + 檔案串流頻道
 const HS_NONCE_LEN: usize = 32;
 const HS_MAC_LEN: usize = 32; // HMAC-SHA256 輸出長度
 
@@ -240,9 +419,29 @@ pub struct Link {
     motion_seq: u64,
 }
 
+/// 檔案傳輸句柄（`Link::files_link()` 取得），可 clone 進背景 task。
+#[derive(Clone)]
+pub struct FilesLink {
+    conn: Connection,
+}
+
+impl FilesLink {
+    pub async fn send_files(&self, paths: &[PathBuf]) -> Result<()> {
+        send_files_on(&self.conn, paths).await
+    }
+}
+
 impl Link {
     pub async fn send_reliable(&self, msg: &Reliable) -> Result<()> {
         send_reliable_on(&self.conn, msg).await
+    }
+
+    /// 可 clone 的檔案傳輸句柄 —— 檔案大、傳輸久，app 端 spawn 背景 task 用它送，
+    /// 不借走 `Link` 本體（drive loop 還要繼續送鍵鼠）。
+    pub fn files_link(&self) -> FilesLink {
+        FilesLink {
+            conn: self.conn.clone(),
+        }
     }
 
     pub fn send_motion(&mut self, x: f64, y: f64) -> Result<()> {

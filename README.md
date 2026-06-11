@@ -137,11 +137,13 @@ QUIC/TLS encrypts the link, but the client uses skip-verify (no cert pinning yet
 </details>
 
 <details>
-<summary><b>Clipboard sync</b></summary>
+<summary><b>Clipboard sync — text & files</b></summary>
 
-Text clipboard follows the edge switch, both ways: crossing **into** the remote pushes the controller's clipboard to it; crossing **back** pulls whatever you copied over there. No always-on clipboard watching — macOS has no pasteboard-change callback (polling only), and syncing at the switch covers the actual KVM flow (you copy, then you shove the cursor across to paste). Same trigger Deskflow uses.
+The clipboard follows the edge switch, both ways: crossing **into** the remote pushes the controller's clipboard to it; crossing **back** pulls whatever you copied over there. No always-on clipboard watching — macOS has no pasteboard-change callback (polling only), and syncing at the switch covers the actual KVM flow (you copy, then you shove the cursor across to paste). Same trigger Deskflow uses.
 
-Implementation notes: content rides the existing reliable stream as a new `Clipboard` message (the wire bump is why `HS_VERSION` is 2); the controlled side answers `Leave` by pushing its clipboard back on a server→client uni stream. Both ends keep a content fingerprint and skip the send when nothing changed — re-pushing identical content would stomp the far side's clipboard history on every switch. Text-only for now, 1 MiB cap (oversized content is skipped, never truncated — half a paste is worse than none), and any clipboard failure degrades silently rather than touching the input path.
+**Files** need more than the text path: a "copied file" in the system clipboard is just a path reference (`public.file-url` on macOS, `CF_HDROP` on Windows), meaningless on the other machine. So quickvm streams the file **contents** across (chunked, never fully in memory), lands them in a temp dir on the far side, and points the far clipboard at the landed copies — pasting there produces real files. File lists come straight from the platform APIs (NSPasteboard / CF_HDROP via hand-rolled Win32, since arboard does text and images only); folders are skipped (v1, same as Deskflow), 256 MiB total cap, and big transfers ride their own tagged uni stream in a background task so the switch itself never waits.
+
+Implementation notes: every reliable uni stream starts with a tag byte — `0x00` small postcard message, `0x01` file stream (the wire change is why `HS_VERSION` is 3); the controlled side answers `Leave` by pushing its clipboard back on a server→client uni stream. Both ends keep a content fingerprint (text: content hash; files: path+size+mtime, domain-separated) and skip the send when nothing changed — re-pushing identical content would stomp the far side's clipboard history on every switch. Received filenames are sanitized to their basename (no path traversal), name collisions get ` (n)` suffixes, temp dirs are swept on startup, and any clipboard failure degrades silently rather than touching the input path. Text cap stays at 1 MiB (skipped, never truncated — half a paste is worse than none).
 
 </details>
 
@@ -158,9 +160,9 @@ Residual latency is dominated by the **controller's Wi-Fi link** (RTT base drift
 
 - [x] Screen-edge enter/leave + input swallow (real KVM feel)
 - [x] Cursor grab/freeze, modifiers, auto-reconnect, fixed-tick motion coalescing
-- [x] Clipboard sync (text, both directions, synced on edge switch)
+- [x] Clipboard sync (text + files, both directions, synced on edge switch)
 - [ ] Windows capture (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) for bidirectional control
-- [ ] Clipboard v2: images / files
+- [ ] Clipboard: images
 - [ ] Proportional screen mapping (portrait Mac vs landscape Windows aren't equal-ratio yet)
 - [ ] SSH-like cert fingerprint trust (replace skip-verify); CC tuning (BBR / larger initial cwnd)
 - [ ] `serve` as a persistent / boot-start service
