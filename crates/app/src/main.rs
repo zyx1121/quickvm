@@ -394,3 +394,131 @@ fn update_mods(mods: &mut Modifiers, usage: u16, dir: Direction) {
         Direction::Release => mods.0 &= !bit,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── enter_point：撞到「朝向對端」的邊緣才穿過去，並落在對端的相反邊 ──
+    // 撞到底時 capture 會把絕對座標 clamp 到 0/1，所以用 0.0 / 1.0 當「撞到」輸入。
+
+    #[test]
+    fn enter_point_right_enters_remote_left_edge() {
+        // 對端在右 → 從對端左緣（EDGE）進，y 比例沿用（cross-axis 保留）。
+        assert_eq!(enter_point(Side::Right, 1.0, 0.3), Some((EDGE, 0.3)));
+    }
+
+    #[test]
+    fn enter_point_left_enters_remote_right_edge() {
+        assert_eq!(enter_point(Side::Left, 0.0, 0.7), Some((1.0 - EDGE, 0.7)));
+    }
+
+    #[test]
+    fn enter_point_bottom_enters_remote_top_edge() {
+        assert_eq!(enter_point(Side::Bottom, 0.4, 1.0), Some((0.4, EDGE)));
+    }
+
+    #[test]
+    fn enter_point_top_enters_remote_bottom_edge() {
+        assert_eq!(enter_point(Side::Top, 0.6, 0.0), Some((0.6, 1.0 - EDGE)));
+    }
+
+    #[test]
+    fn enter_point_center_never_crosses() {
+        for side in [Side::Right, Side::Left, Side::Top, Side::Bottom] {
+            assert_eq!(enter_point(side, 0.5, 0.5), None);
+        }
+    }
+
+    #[test]
+    fn enter_point_wrong_edge_does_not_cross() {
+        // 撞到「非朝向對端」的邊緣不能穿——否則游標一碰任何邊就被吸走。
+        assert_eq!(enter_point(Side::Right, 0.0, 0.5), None); // 反向邊
+        assert_eq!(enter_point(Side::Right, 0.5, 1.0), None); // 正交邊
+        assert_eq!(enter_point(Side::Left, 1.0, 0.5), None);
+        assert_eq!(enter_point(Side::Bottom, 0.5, 0.0), None);
+        assert_eq!(enter_point(Side::Top, 0.5, 1.0), None);
+    }
+
+    // ── left_remote：虛擬游標（對端像素座標）越過「朝向本機」的邊界才交還 ──
+
+    const W: f64 = 1920.0;
+    const H: f64 = 1080.0;
+
+    #[test]
+    fn left_remote_right_returns_via_remote_left_edge() {
+        // 對端在右 → 本機在對端左 → vx 越過 0 才回去；貼著 0 還算在對端。
+        assert!(left_remote(Side::Right, -0.1, 540.0, W, H));
+        assert!(!left_remote(Side::Right, 0.0, 540.0, W, H));
+        assert!(!left_remote(Side::Right, W, 540.0, W, H)); // 遠端另一側只 clamp 不交還
+    }
+
+    #[test]
+    fn left_remote_left_returns_via_remote_right_edge() {
+        assert!(left_remote(Side::Left, W + 0.1, 540.0, W, H));
+        assert!(!left_remote(Side::Left, W, 540.0, W, H));
+        assert!(!left_remote(Side::Left, 0.0, 540.0, W, H));
+    }
+
+    #[test]
+    fn left_remote_bottom_returns_via_remote_top_edge() {
+        assert!(left_remote(Side::Bottom, 960.0, -0.1, W, H));
+        assert!(!left_remote(Side::Bottom, 960.0, 0.0, W, H));
+        assert!(!left_remote(Side::Bottom, 960.0, H, W, H));
+    }
+
+    #[test]
+    fn left_remote_top_returns_via_remote_bottom_edge() {
+        assert!(left_remote(Side::Top, 960.0, H + 0.1, W, H));
+        assert!(!left_remote(Side::Top, 960.0, H, W, H));
+        assert!(!left_remote(Side::Top, 960.0, 0.0, W, H));
+    }
+
+    // ── update_mods：HID usage 0xE0–0xE7 維護 Modifiers bitflags ──
+
+    #[test]
+    fn update_mods_press_sets_and_release_clears_each_modifier() {
+        // 左右修飾鍵各自的 usage 都要映到同一個 bit——漏任何一個 = Enter 帶過去的狀態缺角。
+        let cases: [(u16, u16); 8] = [
+            (0xE0, Modifiers::CTRL),
+            (0xE1, Modifiers::SHIFT),
+            (0xE2, Modifiers::ALT),
+            (0xE3, Modifiers::META),
+            (0xE4, Modifiers::CTRL),
+            (0xE5, Modifiers::SHIFT),
+            (0xE6, Modifiers::ALT),
+            (0xE7, Modifiers::META),
+        ];
+        for (usage, bit) in cases {
+            let mut mods = Modifiers::default();
+            update_mods(&mut mods, usage, Direction::Press);
+            assert_eq!(mods.0, bit, "press 0x{usage:02X} 應設位");
+            update_mods(&mut mods, usage, Direction::Release);
+            assert_eq!(mods.0, 0, "release 0x{usage:02X} 應清位");
+        }
+    }
+
+    #[test]
+    fn update_mods_ignores_non_modifier_usage() {
+        // 一般按鍵（如 0x04 = A）不能動到 bitflags——否則打字會污染修飾鍵狀態。
+        let mut mods = Modifiers(Modifiers::CTRL | Modifiers::SHIFT);
+        update_mods(&mut mods, 0x04, Direction::Press);
+        update_mods(&mut mods, 0x04, Direction::Release);
+        assert_eq!(mods.0, Modifiers::CTRL | Modifiers::SHIFT);
+    }
+
+    #[test]
+    fn update_mods_stacks_multiple_modifiers() {
+        let mut mods = Modifiers::default();
+        update_mods(&mut mods, 0xE0, Direction::Press); // L-Ctrl
+        update_mods(&mut mods, 0xE1, Direction::Press); // L-Shift
+        update_mods(&mut mods, 0xE3, Direction::Press); // L-Meta
+        assert_eq!(mods.0, Modifiers::CTRL | Modifiers::SHIFT | Modifiers::META);
+        // 放開其中一個不影響其餘。
+        update_mods(&mut mods, 0xE1, Direction::Release);
+        assert_eq!(mods.0, Modifiers::CTRL | Modifiers::META);
+        // 左右同名鍵共用一個 bit：右 Ctrl release 會清掉左 Ctrl 設的位（現行語意）。
+        update_mods(&mut mods, 0xE4, Direction::Release);
+        assert_eq!(mods.0, Modifiers::META);
+    }
+}
