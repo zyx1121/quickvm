@@ -235,6 +235,11 @@ async fn drive(
     cap: &mut dyn quickvm_capture::InputCapture,
     last_synced: &mut Option<u64>,
 ) -> Result<()> {
+    // capture 在重連 loop 外就啟動，連線建立前 / 斷線期間仍持續塞 channel。
+    // 連上瞬間先清掉這些堆積 —— 否則使用者趁未連線時在本機的操作會被當輸入一次回放、
+    // 在連上的瞬間全噴給對端（serve 晚起時尤其明顯：累積一大串點擊鍵盤瞬間灌過去）。
+    while rx.try_recv().is_ok() {}
+
     let mut target = Target::Local;
     // Remote 模式下的虛擬游標（對端像素座標）。
     let (mut vx, mut vy) = (0.0_f64, 0.0_f64);
