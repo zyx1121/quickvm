@@ -27,6 +27,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "quickvm", version, about = "QUIC 鍵鼠跨機分享 (v1)")]
 struct Cli {
+    /// 把 log 寫到檔（而非 stderr）；無 console 的背景服務（Windows GUI subsystem task）必備。
+    #[arg(long, global = true)]
+    log_file: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -53,11 +56,37 @@ enum Cmd {
 async fn main() -> Result<()> {
     #[cfg(windows)]
     attach_parent_console();
-    tracing_subscriber::fmt::init();
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let _log_guard = init_tracing(cli.log_file.as_deref())?;
+    match cli.cmd {
         Cmd::Serve { bind } => run_serve(bind).await,
         Cmd::Connect { config, server } => run_connect(config, server).await,
     }
+}
+
+/// 初始化 tracing：有 --log-file 就 append 寫該檔（無 ANSI），否則寫 stderr。
+/// 回傳的 guard 須存活到程式結束（drop 時 flush non-blocking writer），故由 main 持有。
+fn init_tracing(
+    log_file: Option<&std::path::Path>,
+) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+    let Some(path) = log_file else {
+        tracing_subscriber::fmt::init();
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("開 log 檔失敗：{}", path.display()))?;
+    let (nb, guard) = tracing_appender::non_blocking(file);
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(nb)
+        .init();
+    Ok(Some(guard))
 }
 
 /// GUI subsystem 沒有 console：從 terminal 跑時 attach 回父 console 讓輸出 / clap
@@ -71,19 +100,49 @@ fn attach_parent_console() {
     }
 }
 
-/// 共享密鑰（PSK）：兩端必須相同。從環境變數 `QUICKVM_SECRET` 讀，未設則拒絕啟動
-/// —— 沒有它就是「任何人連上即可控制本機」，不允許靜默以不安全模式跑。
+/// 共享密鑰（PSK）：兩端必須相同。優先讀環境變數 `QUICKVM_SECRET`，未設則 fallback
+/// 讀 `~/.config/quickvm/secret`（單行）。兩者皆無則拒絕啟動 —— 沒有它就是
+/// 「任何人連上即可控制本機」，不允許靜默以不安全模式跑。檔案 fallback 讓無 console
+/// 的背景服務（Windows GUI subsystem task）免在啟動命令字串裡明文埋 secret。
 fn load_secret() -> Result<Vec<u8>> {
-    let s = std::env::var("QUICKVM_SECRET").map_err(|_| {
-        anyhow::anyhow!(
-            "未設 QUICKVM_SECRET —— 兩端需設相同的共享密鑰（建議 32+ 字元隨機字串）。\n\
-             例：export QUICKVM_SECRET=\"$(openssl rand -hex 32)\""
-        )
-    })?;
+    let s = match std::env::var("QUICKVM_SECRET") {
+        Ok(v) => v,
+        Err(_) => read_secret_file()?,
+    };
+    let s = s.trim();
     if s.len() < 16 {
         anyhow::bail!("QUICKVM_SECRET 太短（<16 字元），請用更長的隨機字串");
     }
-    Ok(s.into_bytes())
+    Ok(s.as_bytes().to_vec())
+}
+
+/// env 未設時的 fallback：讀 `~/.config/quickvm/secret`（與 config.toml / cert.der 同層）。
+fn read_secret_file() -> Result<String> {
+    let path = dirs::home_dir()
+        .map(|h| h.join(".config/quickvm/secret"))
+        .context("找不到 home 目錄，無法定位 secret 檔")?;
+    let s = std::fs::read_to_string(&path).map_err(|e| {
+        anyhow::anyhow!(
+            "未設 QUICKVM_SECRET，且讀 {p} 失敗：{e}\n\
+             兩端需設相同共享密鑰：export QUICKVM_SECRET=\"$(openssl rand -hex 32)\"，\
+             或把該值寫進 {p}",
+            p = path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    warn_if_secret_world_readable(&path);
+    Ok(s)
+}
+
+/// Unix：secret 檔權限過寬（group / other 可讀）時警告（不阻擋）。
+#[cfg(unix)]
+fn warn_if_secret_world_readable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        tracing::warn!(path = %path.display(), "secret 檔權限過寬，建議 chmod 600");
+    }
 }
 
 /// 被控端：注入收到的事件。

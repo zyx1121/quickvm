@@ -16,6 +16,7 @@ quickvm-transport = { version = "0.1.0", path = "../transport" }
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+tracing-appender = "0.2.3"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 dirs = "5.0"
