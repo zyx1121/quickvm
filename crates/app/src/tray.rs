@@ -14,7 +14,7 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::sync::{Mutex, OnceLock};
 use std::{mem, ptr};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -25,10 +25,10 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, HWND_MESSAGE, IDI_APPLICATION, LoadIconW,
-    MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
-    TPM_RIGHTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
-    WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    DispatchMessageW, GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_SEPARATOR,
+    MF_STRING, MSG, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+    SetTimer, TPM_RIGHTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY,
+    WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
 };
 
 /// tray icon 點擊回呼訊息（自訂，WM_APP 之上）。
@@ -41,6 +41,8 @@ const ID_QUIT: u32 = 3;
 static CHILD: Mutex<Option<Child>> = Mutex::new(None);
 /// 使用者期望 serve 在跑（按停止 → false）。看門狗只在這為 true 時重拉，否則「停止」會被秒拉回。
 static DESIRED: AtomicBool = AtomicBool::new(false);
+/// explorer.exe 重啟會清掉所有 tray 圖示並廣播 TaskbarCreated；收到就重加，否則 daemon 跑久了圖示會消失。
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static EXE: OnceLock<PathBuf> = OnceLock::new();
 static BIND: OnceLock<String> = OnceLock::new();
 static SERVE_LOG: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -59,9 +61,12 @@ pub fn run(bind: SocketAddr, serve_log: Option<PathBuf>) -> Result<()> {
         wc.lpszClassName = class.as_ptr();
         RegisterClassW(&wc);
 
+        // explorer 重啟後靠這個廣播訊息重加圖示（message-only 視窗收不到廣播，故用一般 top-level）。
+        TASKBAR_CREATED.store(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()), SeqCst);
+
         let name = wide("QuicKVM");
         let hwnd = CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW, // 不進工作列 / alt-tab
             class.as_ptr(),
             name.as_ptr(),
             0,
@@ -69,7 +74,7 @@ pub fn run(bind: SocketAddr, serve_log: Option<PathBuf>) -> Result<()> {
             0,
             0,
             0,
-            HWND_MESSAGE, // message-only 視窗：無 UI，只收訊息
+            ptr::null_mut(), // 一般 top-level 隱藏視窗（不 ShowWindow）：收得到 TaskbarCreated 廣播、可被 FindWindow 找到
             ptr::null_mut(),
             hinstance as _,
             ptr::null(),
@@ -95,6 +100,13 @@ pub fn run(bind: SocketAddr, serve_log: Option<PathBuf>) -> Result<()> {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // explorer 重啟 → 重加圖示（動態註冊的訊息 id，無法當 const match）。
+    let tc = TASKBAR_CREATED.load(SeqCst);
+    if tc != 0 && msg == tc {
+        add_icon(hwnd);
+        update_tip(hwnd);
+        return 0;
+    }
     match msg {
         WM_TRAY => {
             // 非 v4 通知：lParam 低字為滑鼠訊息。左 / 右鍵都彈選單。
