@@ -62,7 +62,10 @@ pub fn run(bind: SocketAddr, serve_log: Option<PathBuf>) -> Result<()> {
         RegisterClassW(&wc);
 
         // explorer 重啟後靠這個廣播訊息重加圖示（message-only 視窗收不到廣播，故用一般 top-level）。
-        TASKBAR_CREATED.store(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()), SeqCst);
+        TASKBAR_CREATED.store(
+            RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
+            SeqCst,
+        );
 
         let name = wide("QuicKVM");
         let hwnd = CreateWindowExW(
@@ -127,7 +130,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     update_tip(hwnd);
                 }
                 ID_LOG => open_log(),
-                ID_QUIT => unsafe { DestroyWindow(hwnd); },
+                ID_QUIT => unsafe {
+                    DestroyWindow(hwnd);
+                },
                 _ => {}
             }
             0
@@ -181,7 +186,11 @@ fn remove_icon(hwnd: HWND) {
 fn show_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu();
-        let toggle = wide(if DESIRED.load(SeqCst) { "停止" } else { "啟動" });
+        let toggle = wide(if DESIRED.load(SeqCst) {
+            "停止"
+        } else {
+            "啟動"
+        });
         AppendMenuW(menu, MF_STRING, ID_TOGGLE as usize, toggle.as_ptr());
         let log = wide("開啟 log");
         AppendMenuW(menu, MF_STRING, ID_LOG as usize, log.as_ptr());
