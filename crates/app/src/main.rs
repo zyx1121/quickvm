@@ -12,6 +12,8 @@
 mod clipboard;
 mod clipboard_files;
 mod config;
+#[cfg(windows)]
+mod tray;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -50,6 +52,14 @@ enum Cmd {
         #[arg(long)]
         server: Option<SocketAddr>,
     },
+    /// Windows 系統匣常駐：顯示 tray 圖示控制 serve 開關（啟動時自動拉起 serve child）。
+    Tray {
+        #[arg(long, default_value = "0.0.0.0:7777")]
+        bind: SocketAddr,
+        /// serve child 的 log 檔（沿用既有 serve log 路徑）。
+        #[arg(long)]
+        serve_log: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -61,7 +71,19 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Serve { bind } => run_serve(bind).await,
         Cmd::Connect { config, server } => run_connect(config, server).await,
+        // tray 是同步 Win32 訊息迴圈（serve 跑在 spawn 出去的 child，本程序不需 runtime）。
+        Cmd::Tray { bind, serve_log } => run_tray(bind, serve_log),
     }
+}
+
+#[cfg(windows)]
+fn run_tray(bind: SocketAddr, serve_log: Option<PathBuf>) -> Result<()> {
+    tray::run(bind, serve_log)
+}
+
+#[cfg(not(windows))]
+fn run_tray(_bind: SocketAddr, _serve_log: Option<PathBuf>) -> Result<()> {
+    anyhow::bail!("tray 子命令僅支援 Windows")
 }
 
 /// 初始化 tracing：有 --log-file 就 append 寫該檔（無 ANSI），否則寫 stderr。
