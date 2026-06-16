@@ -158,8 +158,11 @@ fn add_icon(hwnd: HWND) {
         let mut nid = base_nid(hwnd);
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
-        // 嵌在 exe 裡的閃電圖示（build.rs 以 id 1 嵌入）；1 as PCWSTR = MAKEINTRESOURCE(1)。
-        nid.hIcon = LoadIconW(GetModuleHandleW(ptr::null()) as _, 1 as *const u16);
+        // 嵌在 exe 裡的閃電圖示（build.rs 以 id 1 嵌入）；位址=1 的無 provenance 指標 = MAKEINTRESOURCE(1)。
+        nid.hIcon = LoadIconW(
+            GetModuleHandleW(ptr::null()) as _,
+            ptr::without_provenance(1),
+        );
         set_tip(&mut nid, "QuicKVM serve");
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
