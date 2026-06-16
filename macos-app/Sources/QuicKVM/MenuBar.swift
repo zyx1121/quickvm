@@ -12,23 +12,22 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     init(controller: QuickVMController) {
         self.controller = controller
         super.init()
-        controller.onStateChange = { [weak self] in self?.refreshIcon() }
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
-        refreshIcon()
+        item.button?.image = Self.mark
         rebuildMenu()
     }
 
-    private func icon(running: Bool) -> NSImage {
-        let name = running ? "bolt.horizontal.circle.fill" : "bolt.horizontal.circle"
-        let img = NSImage(systemSymbolName: name, accessibilityDescription: "QuicKVM")
-            ?? NSImage(systemSymbolName: "display", accessibilityDescription: "QuicKVM")!
-        img.isTemplate = true // 跟著選單列明暗
+    /// 品牌 mark（閃電）。不隨執行/停止換樣 —— 狀態看選單文字。template：跟著選單列明暗。
+    private static let mark: NSImage = {
+        let img = Bundle.main.path(forResource: "BoltMark", ofType: "png")
+            .flatMap { NSImage(contentsOfFile: $0) }
+            ?? NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "QuicKVM")!
+        img.isTemplate = true
+        img.size = NSSize(width: 18, height: 18 * img.size.height / max(img.size.width, 1))
         return img
-    }
-
-    private func refreshIcon() { item.button?.image = icon(running: controller.isRunning) }
+    }()
 
     func menuWillOpen(_: NSMenu) { rebuildMenu() }
 
@@ -78,7 +77,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func toggleRun() {
         controller.toggle()
-        refreshIcon()
     }
 
     /// 彈窗把 QuicKVM 加進「輔助使用」清單並開啟設定面板（CGEventTap 的 TCC 主體是本 app）。

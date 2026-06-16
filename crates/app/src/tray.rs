@@ -25,10 +25,10 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_SEPARATOR,
-    MF_STRING, MSG, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetTimer, TPM_RIGHTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
+    TPM_RIGHTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
 };
 
 /// tray icon 點擊回呼訊息（自訂，WM_APP 之上）。
@@ -158,7 +158,8 @@ fn add_icon(hwnd: HWND) {
         let mut nid = base_nid(hwnd);
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
+        // 嵌在 exe 裡的閃電圖示（build.rs 以 id 1 嵌入）；1 as PCWSTR = MAKEINTRESOURCE(1)。
+        nid.hIcon = LoadIconW(GetModuleHandleW(ptr::null()) as _, 1 as *const u16);
         set_tip(&mut nid, "QuicKVM serve");
         Shell_NotifyIconW(NIM_ADD, &nid);
     }
