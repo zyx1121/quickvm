@@ -35,6 +35,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Windows：build.rs 用它把 quickvm.ico 嵌進 exe（tray 圖示 + exe 圖示）。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 # 檔案剪貼簿（NSPasteboard file URLs，arboard 不支援 file list）。
 # 版本對齊 enigo 既有的 objc2 生態，不增加重複編譯。
 [target.'cfg(target_os = "macos")'.dependencies]
