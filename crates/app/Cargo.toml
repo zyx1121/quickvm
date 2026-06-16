@@ -21,14 +21,18 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 dirs = "5.0"
 
-# GUI subsystem 下接回父 console（main.rs）+ CF_HDROP 檔案剪貼簿（clipboard_files.rs）。
+# GUI subsystem 下接回父 console（main.rs）+ CF_HDROP 檔案剪貼簿（clipboard_files.rs）
+# + 系統匣常駐控制面（tray.rs：視窗類別 / 訊息迴圈 / popup menu / Shell_NotifyIcon）。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_System_Console",
     "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # 檔案剪貼簿（NSPasteboard file URLs，arboard 不支援 file list）。
