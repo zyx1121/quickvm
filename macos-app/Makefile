@@ -38,7 +38,7 @@ bundle: build
 	@cp $(RUST_BIN) $(CONTENTS)/Helpers/quickvm
 	@cp Resources/Info.plist $(CONTENTS)/Info.plist
 	@cp Resources/AppIcon.icns $(CONTENTS)/Resources/AppIcon.icns
-	@cp Resources/BoltMark.png $(CONTENTS)/Resources/BoltMark.png
+	@cp Resources/MenubarIcon.png $(CONTENTS)/Resources/MenubarIcon.png
 	@codesign --force --options runtime --sign $(SIGN_ID) $(CONTENTS)/Helpers/quickvm
 	@codesign --force --options runtime --entitlements Resources/QuicKVM.entitlements --sign $(SIGN_ID) $(APP_BUNDLE)
 	@codesign --verify --strict --verbose=2 $(APP_BUNDLE)
@@ -67,7 +67,7 @@ release: build
 	@cp $(RUST_BIN) $(CONTENTS)/Helpers/quickvm
 	@cp Resources/Info.plist $(CONTENTS)/Info.plist
 	@cp Resources/AppIcon.icns $(CONTENTS)/Resources/AppIcon.icns
-	@cp Resources/BoltMark.png $(CONTENTS)/Resources/BoltMark.png
+	@cp Resources/MenubarIcon.png $(CONTENTS)/Resources/MenubarIcon.png
 	@codesign --force --options runtime --timestamp --sign "$(DEV_ID_APP)" $(CONTENTS)/Helpers/quickvm
 	@codesign --force --options runtime --timestamp --entitlements Resources/QuicKVM.entitlements --sign "$(DEV_ID_APP)" $(APP_BUNDLE)
 	@codesign --verify --strict --verbose=2 $(APP_BUNDLE)

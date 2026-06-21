@@ -19,13 +19,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         rebuildMenu()
     }
 
-    /// 品牌 mark（閃電）。不隨執行/停止換樣 —— 狀態看選單文字。template：跟著選單列明暗。
+    /// 品牌 mark（全家共用的 zyx 標）。不隨執行/停止換樣 —— 狀態看選單文字。template：跟著選單列明暗。
     private static let mark: NSImage = {
-        let img = Bundle.main.path(forResource: "BoltMark", ofType: "png")
+        let img = Bundle.main.path(forResource: "MenubarIcon", ofType: "png")
             .flatMap { NSImage(contentsOfFile: $0) }
             ?? NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "QuicKVM")!
         img.isTemplate = true
-        img.size = NSSize(width: 18, height: 18 * img.size.height / max(img.size.width, 1))
+        let h: CGFloat = 18
+        img.size = NSSize(width: h * img.size.width / max(img.size.height, 1), height: h)
         return img
     }()
 
