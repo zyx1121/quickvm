@@ -21,6 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SVG = os.path.join(HERE, "zyx.svg")
 OUT_ICNS = os.path.join(ROOT, "Resources", "AppIcon.icns")
+OUT_MENUBAR = os.path.join(ROOT, "Resources", "MenubarIcon.png")
 S = 1024
 
 # 深色圓角底（垂直漸層 #20232a → #0c0d10）、圓角比例、logo 佔畫布比例 —— 全家統一視覺簽名。
@@ -86,12 +87,17 @@ def to_icns(png_1024: str) -> None:
 
 
 def main() -> None:
-    img = compose(render_logo())
+    logo = render_logo()
+    # 選單列 template 圖:只有 zyx 字符 + 透明底(無 squircle 底);isTemplate 只看 alpha,
+    # 系統會跟著選單列明暗自己上色。狀態靠選單文字表達,不靠這顆圖示。
+    os.makedirs(os.path.dirname(OUT_MENUBAR), exist_ok=True)
+    logo.save(OUT_MENUBAR)
+    img = compose(logo)
     with tempfile.TemporaryDirectory() as tmp:
         png = os.path.join(tmp, "icon-1024.png")
         img.save(png)
         to_icns(png)
-    print(f"[OK] {os.path.relpath(OUT_ICNS, ROOT)}")
+    print(f"[OK] {os.path.relpath(OUT_ICNS, ROOT)} + {os.path.relpath(OUT_MENUBAR, ROOT)}")
 
 
 if __name__ == "__main__":
