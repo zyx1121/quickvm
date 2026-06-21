@@ -21,7 +21,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     /// 品牌 mark（全家共用的 zyx 標）。不隨執行/停止換樣 —— 狀態看選單文字。template：跟著選單列明暗。
     private static let mark: NSImage = {
-        let img = Bundle.main.path(forResource: "MenubarIcon", ofType: "png")
+        let img = Bundle.main.path(forResource: "MenubarIcon", ofType: "pdf")
             .flatMap { NSImage(contentsOfFile: $0) }
             ?? NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "QuicKVM")!
         img.isTemplate = true
