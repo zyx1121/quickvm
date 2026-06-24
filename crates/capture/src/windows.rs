@@ -94,6 +94,11 @@ impl InputCapture for WinCapture {
             }
         }
     }
+
+    // TODO(security): Windows-as-controller 沒有 escape_requested 逃生鍵（用 trait 預設 false）。
+    // 對端被拿走 / 斷網時，king 只能靠縮短的 idle timeout（~4s）自動 ungrab，沒有 macOS 那種
+    // 網路無關的就地保命路徑。不照搬「左右 Cmd」是因 R-Win 鍵非所有鍵盤都有；待選定一個
+    // 全鍵盤都有的組合（如連點 Ctrl×N 或 Ctrl+Alt+角落）後在 LL keyboard hook 內補上。
 }
 
 fn run_hooks() {

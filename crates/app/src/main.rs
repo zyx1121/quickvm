@@ -331,6 +331,12 @@ async fn drive(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(8)); // 125Hz
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // 連線判死立即 bail → 外層 ungrab + 重連。不再只依賴「send 剛好失敗」或 back_rx 關閉
+    // （兩者都要等到 quinn 判死那刻、且 send 失敗還需使用者剛好在動）。配合縮短的 idle timeout，
+    // 對端被拿走 / 斷網 / 換網段時，Mac 凍結時間從 ~30s 壓到判死窗（數秒）內。
+    let conn_closed = link.closed_signal();
+    tokio::pin!(conn_closed);
+
     loop {
         tokio::select! {
             // 公平輪詢：不能 biased，否則高頻事件會餓死 ticker → pending 永不送、游標不動。
@@ -402,9 +408,23 @@ async fn drive(
                 }
             }
             _ = ticker.tick() => {
+                // 逃生鍵：capture 後端偵測到 panic 組合（macOS = 左右 Cmd 同時按）已就地解除 grab
+                // （網路無關）。這裡把狀態機交還本機並通知對端 release 黏鍵；Leave 送失敗代表
+                // 連線已死 → 由 `?` bail 走重連（grab 已 false，本機照常可用）。
+                if cap.escape_requested() && matches!(target, Target::Remote) {
+                    cap.set_grab(false);
+                    target = Target::Local;
+                    pending = None;
+                    tracing::warn!("逃生鍵 — 強制交還本機");
+                    link.send_reliable(&Reliable::Control(Control::Leave)).await?;
+                }
                 if let Some((x, y)) = pending.take() {
                     link.send_motion(x / cfg.remote.width, y / cfg.remote.height)?;
                 }
+            }
+            // 連線判死 → 立即交還本機（外層 ungrab）並重連。
+            _ = &mut conn_closed => {
+                anyhow::bail!("連線已關閉（idle timeout / 對端 close）");
             }
             // 被控端的回送（Leave 時回推剪貼簿 / 檔案）。channel 關閉 = 連線死，
             // 回 Err 走外層重連 —— 不能留在 select 裡（closed channel 立即 ready → busy loop）。

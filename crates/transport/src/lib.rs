@@ -26,6 +26,13 @@ const MAX_FRAME: usize = quickvm_proto::CLIPBOARD_MAX + 64;
 // 檔案串流的讀寫 chunk。
 const FILE_CHUNK: usize = 64 * 1024;
 
+// 連線判死窗。主控端 grab 期間若對端被拿走 / 斷網 / 換網段，本機輸入持續被吞、Mac 凍住，
+// 直到連線被判死才 ungrab —— 故這個值＝Mac 最久凍多久。壓到 4s（WiFi RTT spike ~100ms 容得下），
+// 配合 < 4s 的 keep-alive 在正常閒置時持續重置雙方 idle timer，不會誤斷。
+const QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+// 閒置保活 PING：須 < idle timeout。單端開即可（PING/ACK 往返重置雙方 idle timer）。
+const QUIC_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// 從對端收到的一則訊息。
 #[derive(Debug)]
 pub enum Incoming {
@@ -276,9 +283,10 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 fn server_config() -> Result<ServerConfig> {
     let (cert_der, key_der) = load_or_create_cert()?;
     let mut sc = ServerConfig::with_single_cert(vec![cert_der], key_der.into())?;
-    // 明設 idle timeout，跟 client keep-alive(5s) 對齊，不靠 quinn 預設。
+    // 明設 idle timeout：被控端據此判主控失聯 → release 黏鍵。client keep-alive(1.5s) < 此值，
+    // 正常運作時持續重置；只有真斷才在 QUIC_IDLE_TIMEOUT 後超時，黏鍵不再卡 30s。
     let mut tc = quinn::TransportConfig::default();
-    tc.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into()?));
+    tc.max_idle_timeout(Some(QUIC_IDLE_TIMEOUT.try_into()?));
     sc.transport_config(Arc::new(tc));
     Ok(sc)
 }
@@ -295,10 +303,10 @@ fn client_config(addr: &SocketAddr) -> Result<ClientConfig> {
     let qcc = QuicClientConfig::try_from(Arc::new(tls))?;
     let mut cc = ClientConfig::new(Arc::new(qcc));
     // keep-alive：閒置時定期 PING 保活，否則使用者一段時間不動鍵鼠 → idle timeout 斷線。
-    // 單端開即可（PING 往返重置雙方 idle timer）；interval 須 < server 預設 idle (~30s)。
+    // 單端開即可（PING 往返重置雙方 idle timer）；interval 須 < idle timeout。
     let mut tc = quinn::TransportConfig::default();
-    tc.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    tc.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into()?));
+    tc.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
+    tc.max_idle_timeout(Some(QUIC_IDLE_TIMEOUT.try_into()?));
     cc.transport_config(Arc::new(tc));
     Ok(cc)
 }
@@ -520,6 +528,17 @@ impl Link {
     /// 當前路徑的估計 round-trip 時間（診斷用）。
     pub fn rtt(&self) -> std::time::Duration {
         self.conn.rtt()
+    }
+
+    /// 連線關閉訊號：quinn 一判死（idle timeout / 對端 close）就 resolve。
+    /// 內部 clone 出 `Connection`（cheap，Arc handle）不借 `&self` 生命週期 →
+    /// 回傳的 future 可在 `drive()` 的 `select!` 裡與 `&mut self` 的 `send_*` 並存不撞 borrow。
+    /// 讓主控端不必等「使用者剛好移動滑鼠讓 send 失敗」或 back_rx 關閉，判死當下立即 ungrab。
+    pub fn closed_signal(&self) -> impl std::future::Future<Output = ()> + 'static {
+        let conn = self.conn.clone();
+        async move {
+            let _ = conn.closed().await;
+        }
     }
 }
 
