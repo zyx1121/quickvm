@@ -23,6 +23,12 @@ pub trait InputCapture: Send {
     fn start(&mut self, tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()>;
     /// 是否吞掉本機事件 —— 控制對端時 `true`，本機自用時 `false`。
     fn set_grab(&mut self, grab: bool);
+    /// 主控端本機的「逃生」請求：grab 期間使用者按下平台 panic 組合（macOS = 左右 Cmd 同時按）
+    /// 時，後端已**就地**解除 grab（完全不碰網路，網路死了照樣搶回本機）；app 取走此旗標把
+    /// 狀態機交還本機並通知對端 release 黏鍵。無 panic 組合的平台用預設 `false`。
+    fn escape_requested(&self) -> bool {
+        false
+    }
 }
 
 /// 當前平台的捕捉後端：macOS = CGEventTap、Windows = WH_*_LL hook、其他 = ManualCapture stub。

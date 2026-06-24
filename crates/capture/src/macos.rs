@@ -40,13 +40,15 @@ unsafe extern "C" {
     fn CGEventTapEnable(tap: *const std::ffi::c_void, enable: bool);
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use tokio::sync::mpsc;
 
 pub struct MacCapture {
     grab: Arc<AtomicBool>,
+    /// 逃生旗標：tap callback 偵測到左右 Cmd chord 時 set，app 取走後交還本機。
+    escape: Arc<AtomicBool>,
     /// 主螢幕像素尺寸。
     screen: (f64, f64),
 }
@@ -55,6 +57,7 @@ impl MacCapture {
     pub fn new() -> Self {
         Self {
             grab: Arc::new(AtomicBool::new(false)),
+            escape: Arc::new(AtomicBool::new(false)),
             screen: screen_size(),
         }
     }
@@ -69,11 +72,12 @@ impl Default for MacCapture {
 impl InputCapture for MacCapture {
     fn start(&mut self, tx: mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
         let grab = self.grab.clone();
+        let escape = self.escape.clone();
         let screen = self.screen;
         // CGEventTap + CFRunLoop 必須在自己的 thread 跑（run loop 阻塞）。
         thread::Builder::new()
             .name("quickvm-capture".into())
-            .spawn(move || run_tap(tx, grab, screen))?;
+            .spawn(move || run_tap(tx, grab, escape, screen))?;
         Ok(())
     }
 
@@ -91,9 +95,48 @@ impl InputCapture for MacCapture {
             }
         }
     }
+
+    fn escape_requested(&self) -> bool {
+        self.escape.swap(false, Ordering::SeqCst)
+    }
 }
 
-fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>, screen: (f64, f64)) {
+/// 更新「目前按住的 Cmd 邊」狀態並回報這次轉換後是否構成逃生 chord（左右 Cmd 同時按住）。
+///
+/// FlagsChanged 只給 keycode + 當下 Command flag 是否仍 set；左右 Cmd 共用同一個 flag bit，
+/// 無法只看 flag 分辨，故用 keycode 維護 2-bit 狀態（bit0 = 左 0x37、bit1 = 右 0x36）：
+/// - Command flag 已清 → 兩邊都放開，歸零
+/// - flag 仍 set 且該 keycode 不在集合 → 該邊剛按下，加入
+/// - flag 仍 set 且該 keycode 已在集合 → 該邊放開（另一邊仍按住），移除
+///
+/// 回 true 當且僅當這次轉換後左右都按住 —— 即在「按下第二個 Cmd」的那一刻觸發，
+/// 早於任何放開，故放開時 flag 共享造成的歧義不影響觸發正確性。
+fn update_cmd_chord(state: &mut u8, keycode: u16, cmd_flag_set: bool) -> bool {
+    const L: u8 = 0b01;
+    const R: u8 = 0b10;
+    let bit = match keycode {
+        0x37 => L, // Left Command
+        0x36 => R, // Right Command
+        _ => return false,
+    };
+    if !cmd_flag_set {
+        *state = 0;
+        return false;
+    }
+    if *state & bit == 0 {
+        *state |= bit;
+    } else {
+        *state &= !bit;
+    }
+    *state == (L | R)
+}
+
+fn run_tap(
+    tx: mpsc::UnboundedSender<Event>,
+    grab: Arc<AtomicBool>,
+    escape: Arc<AtomicBool>,
+    screen: (f64, f64),
+) {
     // 對 session event source 設低 suppression interval：否則每筆 warp 後 ~250ms 抑制窗 → 超卡。
     // source 設完即可釋放（interval 記在 session state）；forget 跟 lan-mouse 一致避免 drop 重置。
     if let Ok(src) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) {
@@ -124,6 +167,10 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>, screen: (f64
     let tap_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
     let tap_port_cb = tap_port.clone();
 
+    // 逃生 chord 的左右 Cmd 按住狀態。只由本 callback（單一 CFRunLoop thread）讀寫，
+    // 故 load/store 已足夠，不需 CAS。
+    let cmd_state = AtomicU8::new(0);
+
     let tap = match CGEventTap::new(
         // Session 層（非 HID）：lan-mouse / Deskflow 都用這層 —— warp / suppression / Drop
         // 在 session 層的行為才正確；HID 最底層的 Drop 擋不住游標、suppression 也不吃。
@@ -149,6 +196,24 @@ fn run_tap(tx: mpsc::UnboundedSender<Event>, grab: Arc<AtomicBool>, screen: (f64
                     return CallbackResult::Keep;
                 }
                 _ => {}
+            }
+            // 逃生 chord：grab 期間同時按住左右 Cmd → 就地解除 grab（完全不碰網路，
+            // 對端被拿走 / 斷網 / 換網段時，這是搶回本機唯一不依賴連線狀態的路徑）。
+            // FlagsChanged 才帶修飾鍵轉換；非 grab 時也追蹤狀態但不必動作（grab 已是 false）。
+            if matches!(etype, CGEventType::FlagsChanged) {
+                let kc = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                let cmd_set = event.get_flags().contains(CGEventFlags::CGEventFlagCommand);
+                let mut s = cmd_state.load(Ordering::SeqCst);
+                let chord = update_cmd_chord(&mut s, kc, cmd_set);
+                cmd_state.store(s, Ordering::SeqCst);
+                if chord {
+                    grab.store(false, Ordering::SeqCst);
+                    escape.store(true, Ordering::SeqCst);
+                    cmd_state.store(0, Ordering::SeqCst);
+                    unsafe { CGDisplayShowCursor(CGMainDisplayID()) };
+                    tracing::warn!("逃生 chord（左右 Cmd 同時按）—— 已就地釋放 grab，交還本機");
+                    return CallbackResult::Keep;
+                }
             }
             let g = grab.load(Ordering::SeqCst);
             let is_move = matches!(
@@ -386,4 +451,56 @@ fn cgkeycode_to_hid(keycode: u16) -> Option<u16> {
         0x36 => 0xE7, // RightGUI/Command
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_cmd_chord;
+
+    const L: u16 = 0x37; // Left Command
+    const R: u16 = 0x36; // Right Command
+
+    #[test]
+    fn chord_triggers_only_when_both_cmd_down() {
+        let mut s = 0u8;
+        assert!(!update_cmd_chord(&mut s, L, true)); // 左 Cmd 下
+        assert!(update_cmd_chord(&mut s, R, true)); // 右 Cmd 下 → chord！
+    }
+
+    #[test]
+    fn single_cmd_never_triggers() {
+        let mut s = 0u8;
+        // 同一邊重複 down/誤判不會湊成 chord（flag 仍 set 時 toggle）。
+        assert!(!update_cmd_chord(&mut s, L, true));
+        assert!(!update_cmd_chord(&mut s, L, true)); // 視為左放開 → 空
+        assert!(!update_cmd_chord(&mut s, L, true)); // 又左下
+        assert_eq!(s, 0b01);
+    }
+
+    #[test]
+    fn chord_resets_when_all_cmd_released() {
+        let mut s = 0u8;
+        update_cmd_chord(&mut s, L, true);
+        assert!(!update_cmd_chord(&mut s, L, false)); // Command flag 清 → 全放開
+        assert_eq!(s, 0);
+        assert!(!update_cmd_chord(&mut s, R, true)); // 只剩右，不成 chord
+    }
+
+    #[test]
+    fn release_one_while_holding_other_keeps_the_other() {
+        let mut s = 0u8;
+        update_cmd_chord(&mut s, L, true); // {L}
+        assert!(update_cmd_chord(&mut s, R, true)); // {L,R} chord
+        // 放開左、右仍按（Command flag 仍 set）→ 該邊移除，剩右。
+        assert!(!update_cmd_chord(&mut s, L, true));
+        assert_eq!(s, 0b10);
+    }
+
+    #[test]
+    fn non_cmd_modifier_is_ignored() {
+        let mut s = 0b01; // 左 Cmd 已按
+        // Shift（0x38）等非 Cmd 修飾鍵不能動到 chord 狀態。
+        assert!(!update_cmd_chord(&mut s, 0x38, true));
+        assert_eq!(s, 0b01);
+    }
 }
